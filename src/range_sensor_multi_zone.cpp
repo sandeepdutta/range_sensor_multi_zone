@@ -34,7 +34,7 @@ namespace range_sensor_multi_zone
 
         // Initialize point cloud publishers for each sensor
         for (int i = 0; i < num_sensors_; i++) {
-            std::string topic_name = "sensor_" + std::to_string(i) + "/pointcloud";
+            std::string topic_name = frame_ids_topic_names_[i];
             auto publisher = this->create_publisher<sensor_msgs::msg::PointCloud2>(topic_name, 10);
             pointcloud_publishers_.push_back(publisher);
         }
@@ -143,7 +143,7 @@ namespace range_sensor_multi_zone
     void RangeSensorMultiZone::convert_to_pointcloud(int sensor_id, const VL53L5CX_ResultsData& results)
     {
         // Set frame id based on sensor
-        std::string frame_id = "sensor_" + std::to_string(sensor_id) + "_frame";
+        std::string frame_id ;
         if (sensor_id < (int)frame_ids_topic_names_.size()) {
             frame_id = frame_ids_topic_names_[sensor_id];
         }
