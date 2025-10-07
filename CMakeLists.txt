@@ -4,14 +4,20 @@ project(range_sensor_multi_zone)
 # Generate compile_commands.json for IntelliSense
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+#if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic -O2 -g)
-endif()
+#endif()
 
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_sensor_msgs REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+find_package(PCL REQUIRED)
+find_package(pcl_ros REQUIRED)
+find_package(pcl_conversions REQUIRED)
 
 add_executable(range_sensor_multi_zone
     src/platform/linux_platform.cpp
@@ -29,6 +35,11 @@ ament_target_dependencies(
   range_sensor_multi_zone
   "rclcpp"
   "sensor_msgs"
+  "tf2_ros"
+  "tf2_sensor_msgs"
+  "tf2_geometry_msgs"
+  "pcl_ros"
+  "pcl_conversions"
 )
 
 install(TARGETS range_sensor_multi_zone

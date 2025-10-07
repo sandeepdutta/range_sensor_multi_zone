@@ -6,7 +6,7 @@
       "includePath": [
         "${workspaceFolder}/**",
         "${workspaceFolder}/include",
-        "${workspaceFolder}/isaac_ros-dev/src/range_sensor_multi_zone/include"
+        "/home/jeeves/workspaces/isaac_ros-dev/src/range_sensor_multi_zone/include/range_sensor_multi_zone"
       ],
       "defines": [],
       "compilerPath": "/usr/bin/gcc",

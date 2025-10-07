@@ -43,7 +43,7 @@ typedef struct
  * zone means a lower RAM). The value must be between 1 and 4.
  */
 
-#define 	VL53L5CX_NB_TARGET_PER_ZONE		4U
+#define 	VL53L5CX_NB_TARGET_PER_ZONE		1U
 
 /*
  * @brief The macro below can be used to avoid data conversion into the driver.
@@ -60,13 +60,13 @@ typedef struct
  * I2C access.
  */
 
-// #define VL53L5CX_DISABLE_AMBIENT_PER_SPAD
+#define VL53L5CX_DISABLE_AMBIENT_PER_SPAD
 // #define VL53L5CX_DISABLE_NB_SPADS_ENABLED
 // #define VL53L5CX_DISABLE_NB_TARGET_DETECTED
-// #define VL53L5CX_DISABLE_SIGNAL_PER_SPAD
-// #define VL53L5CX_DISABLE_RANGE_SIGMA_MM
+#define VL53L5CX_DISABLE_SIGNAL_PER_SPAD
+#define VL53L5CX_DISABLE_RANGE_SIGMA_MM
 // #define VL53L5CX_DISABLE_DISTANCE_MM
-// #define VL53L5CX_DISABLE_REFLECTANCE_PERCENT
+#define VL53L5CX_DISABLE_REFLECTANCE_PERCENT
 // #define VL53L5CX_DISABLE_TARGET_STATUS
 #define VL53L5CX_DISABLE_MOTION_INDICATOR
 
