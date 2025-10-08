@@ -42,6 +42,7 @@ namespace range_sensor_multi_zone
             uint8_t sensor_mask_;
             double horizontal_fov_;
             double vertical_fov_;
+            int sharpener_percent_;
             std::vector<std::string> frame_ids_;
             std::vector<std::string> topic_names_;
             std::vector<std::string> frame_ids_topic_names_;

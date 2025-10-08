@@ -31,6 +31,7 @@ namespace range_sensor_multi_zone
         sensor_mask_ = this->declare_parameter("sensor_mask", 0); // 0 = all sensors enabled
         horizontal_fov_ = this->declare_parameter("horizontal_fov", 53.0); // degrees
         vertical_fov_ = this->declare_parameter("vertical_fov", 45.0); // degrees
+        sharpener_percent_ = this->declare_parameter("sharpener_percent", 14); // default value from sensor
         ranging_frequency_hz_ = this->declare_parameter("ranging_frequency_hz", 10);
         timer_period_ = 1000 / ranging_frequency_hz_; // in milliseconds
         // add 10% margin
@@ -45,6 +46,7 @@ namespace range_sensor_multi_zone
         RCLCPP_INFO(this->get_logger(), "Horizontal FOV: %f degrees", horizontal_fov_);
         RCLCPP_INFO(this->get_logger(), "Vertical FOV: %f degrees", vertical_fov_);
         RCLCPP_INFO(this->get_logger(), "Resolution: %dx%d", resolution_, resolution_);
+        RCLCPP_INFO(this->get_logger(), "Sharpener percent: %d%%", sharpener_percent_);
         frame_ids_topic_names_ = this->declare_parameter("frame_ids", std::vector<std::string>{"Sensor_0", 
                                                                                                "Sensor_1", 
                                                                                                "Sensor_2", 
@@ -57,7 +59,7 @@ namespace range_sensor_multi_zone
                                 std::bind(&RangeSensorMultiZone::timer_callback, this));
 
         // Initialize combined point cloud publisher
-        combined_pointcloud_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("TOF_pointcloud", 10);
+        combined_pointcloud_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("range_pointcloud", 10);
 
         // Initialize individual point cloud publishers
         pointcloud_publishers_.resize(num_sensors_);
@@ -134,6 +136,13 @@ namespace range_sensor_multi_zone
                 return;
             }
             RCLCPP_INFO(this->get_logger(), "Sensor %d target order set to %d", i, VL53L5CX_TARGET_ORDER_CLOSEST);
+            if (vl53l5cx_set_sharpener_percent(&configuration_, sharpener_percent_) != 0) {
+                RCLCPP_ERROR(this->get_logger(), "Failed to set sharpener percent for sensor %d", i);
+                rclcpp::shutdown();
+                return;
+            }
+            RCLCPP_INFO(this->get_logger(), "Sensor %d sharpener percent set to %d%%", i, sharpener_percent_);
+            RCLCPP_INFO(this->get_logger(), "Sensor %d sharpener percent set to %d", i, 0);
             RCLCPP_INFO(this->get_logger(), "Sensor %d ranging frequency set to %d Hz", i, ranging_frequency_hz_);
             if (vl53l5cx_start_ranging(&configuration_) != 0) {
                 RCLCPP_ERROR(this->get_logger(), "Failed to start ranging for sensor %d", i);
