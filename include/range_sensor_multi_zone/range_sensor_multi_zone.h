@@ -37,12 +37,16 @@ namespace range_sensor_multi_zone
             double min_height_;
             int min_distance_;
             int max_distance_;
+            bool radius_outlier_enabled_;
             double radius_outlier_radius_;
             int radius_outlier_min_neighbors_;
+            bool temporal_filter_enabled_;
+            int temporal_filter_size_;
             uint8_t sensor_mask_;
             double horizontal_fov_;
             double vertical_fov_;
             int sharpener_percent_;
+            int range_sigma_threshold_;
             std::vector<std::string> frame_ids_;
             std::vector<std::string> topic_names_;
             std::vector<std::string> frame_ids_topic_names_;
@@ -53,12 +57,14 @@ namespace range_sensor_multi_zone
             std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
             std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
             std::vector<sensor_msgs::msg::PointCloud2> sensor_pointclouds_;
+            std::vector<pcl::PointCloud<pcl::PointXYZI>::Ptr> pointcloud_buffer_;
 
             void init_sensor();
             void timer_callback();
             void publish_data();
             void convert_to_pointcloud(int sensor_id, const VL53L5CX_ResultsData& results);
             void combine_and_transform_pointclouds();
+            pcl::PointCloud<pcl::PointXYZI>::Ptr apply_temporal_filter(const pcl::PointCloud<pcl::PointXYZI>::Ptr& input_cloud);
             bool is_sensor_enabled(int sensor_id) const;
     };
 }

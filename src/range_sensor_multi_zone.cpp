@@ -26,12 +26,16 @@ namespace range_sensor_multi_zone
         min_height_ = this->declare_parameter("min_height", 0.0);
         min_distance_ = this->declare_parameter("min_distance", 10);
         max_distance_ = this->declare_parameter("max_distance", 500);
+        radius_outlier_enabled_ = this->declare_parameter("radius_outlier_enabled", true);
         radius_outlier_radius_ = this->declare_parameter("radius_outlier_radius", 0.1);
         radius_outlier_min_neighbors_ = this->declare_parameter("radius_outlier_min_neighbors", 3);
+        temporal_filter_enabled_ = this->declare_parameter("temporal_filter_enabled", false);
+        temporal_filter_size_ = this->declare_parameter("temporal_filter_size", 3);
         sensor_mask_ = this->declare_parameter("sensor_mask", 0); // 0 = all sensors enabled
         horizontal_fov_ = this->declare_parameter("horizontal_fov", 53.0); // degrees
         vertical_fov_ = this->declare_parameter("vertical_fov", 45.0); // degrees
         sharpener_percent_ = this->declare_parameter("sharpener_percent", 14); // default value from sensor
+        range_sigma_threshold_ = this->declare_parameter("range_sigma_threshold", 20); // mm
         ranging_frequency_hz_ = this->declare_parameter("ranging_frequency_hz", 10);
         timer_period_ = 1000 / ranging_frequency_hz_; // in milliseconds
         // add 10% margin
@@ -40,13 +44,17 @@ namespace range_sensor_multi_zone
         RCLCPP_INFO(this->get_logger(), "Max height: %f m", max_height_);
         RCLCPP_INFO(this->get_logger(), "Min height: %f m", min_height_);
         RCLCPP_INFO(this->get_logger(), "Min distance: %d mm", min_distance_);
+        RCLCPP_INFO(this->get_logger(), "Radius outlier filter enabled: %s", radius_outlier_enabled_ ? "true" : "false");
         RCLCPP_INFO(this->get_logger(), "Radius outlier radius: %f m", radius_outlier_radius_);
         RCLCPP_INFO(this->get_logger(), "Radius outlier min neighbors: %d", radius_outlier_min_neighbors_);
+        RCLCPP_INFO(this->get_logger(), "Temporal filter enabled: %s", temporal_filter_enabled_ ? "true" : "false");
+        RCLCPP_INFO(this->get_logger(), "Temporal filter size: %d frames", temporal_filter_size_);
         RCLCPP_INFO(this->get_logger(), "Sensor mask: 0x%02X", sensor_mask_);
         RCLCPP_INFO(this->get_logger(), "Horizontal FOV: %f degrees", horizontal_fov_);
         RCLCPP_INFO(this->get_logger(), "Vertical FOV: %f degrees", vertical_fov_);
         RCLCPP_INFO(this->get_logger(), "Resolution: %dx%d", resolution_, resolution_);
         RCLCPP_INFO(this->get_logger(), "Sharpener percent: %d%%", sharpener_percent_);
+        RCLCPP_INFO(this->get_logger(), "Range sigma threshold: %d mm", range_sigma_threshold_);
         frame_ids_topic_names_ = this->declare_parameter("frame_ids", std::vector<std::string>{"Sensor_0", 
                                                                                                "Sensor_1", 
                                                                                                "Sensor_2", 
@@ -249,10 +257,14 @@ namespace range_sensor_multi_zone
             int col = zone_id % resolution_;
 
             // Convert zone coordinates to angular offsets
-            // Center the coordinates: (0,0) is center of sensor
-            // Use proper angular distribution for VL53L5CX sensor
-            float zone_h_angle = ((col - (resolution_ - 1) / 2.0f) / (resolution_ - 1)) * horizontal_fov_rad / 2.0f;
-            float zone_v_angle = ((row - (resolution_ - 1) / 2.0f) / (resolution_ - 1)) * vertical_fov_rad / 2.0f;
+            // Match Python implementation: per_px = deg2rad(fov) / res
+            float per_px_h = horizontal_fov_rad / resolution_;
+            float per_px_v = vertical_fov_rad / resolution_;
+            
+            // Python: w*per_px - deg2rad(fov)/2 - deg2rad(90)
+            float zone_h_angle = col * per_px_h - horizontal_fov_rad / 2.0f - M_PI / 2.0f;
+            // Python: h*per_px - deg2rad(fov)/2
+            float zone_v_angle = row * per_px_v - vertical_fov_rad / 2.0f;
 
             // Process all targets in this zone
             for (int target = 0; target < nb_targets && target < (int)VL53L5CX_NB_TARGET_PER_ZONE; target++) {
@@ -260,20 +272,30 @@ namespace range_sensor_multi_zone
 
                 uint16_t distance_mm = results.distance_mm[target_idx];
                 uint8_t target_status = results.target_status[target_idx];
-                
+                uint16_t range_sigma_mm = results.range_sigma_mm[target_idx];
                 // Skip invalid measurements
-                if (distance_mm <= min_distance_ || distance_mm > max_distance_ || target_status != 5) continue;
+                if (distance_mm <= min_distance_ || 
+                    distance_mm > max_distance_ ||
+                    range_sigma_mm > range_sigma_threshold_ ||
+                    target_status != 5) continue;
                 
                 if (distance_mm < min_distance_mm) min_distance_mm = distance_mm;
                 
                 // Convert distance from mm to meters
                 float distance_m = distance_mm / 1000.0f;
 
-                // Convert spherical coordinates to Cartesian
-                // Using standard robotics convention: X forward, Y left, Z up
-                float x = distance_m * std::cos(zone_v_angle) * std::cos(zone_h_angle);  // Forward
-                float y = distance_m * std::cos(zone_v_angle) * std::sin(zone_h_angle);  // Left
-                float z = distance_m * std::sin(zone_v_angle);                           // Up
+                // Match Python implementation:
+                // x = e*cos(w*per_px - deg2rad(fov)/2 - deg2rad(90))
+                // y = e*sin(h*per_px - deg2rad(fov)/2)
+                // z = e
+                float sensor_x = distance_m * std::cos(zone_h_angle);
+                float sensor_y = distance_m * std::sin(zone_v_angle);
+                float sensor_z = distance_m;
+                
+                // Convert to ROS coordinate system: X forward, Y left, Z up
+                float x = sensor_z;   // Forward
+                float y = sensor_x;   // Left
+                float z = -sensor_y;  // Up (negative because sensor Y is down)
                 
                 if (z > max_z) max_z = z;
                 if (z < min_z) min_z = z;
@@ -311,7 +333,7 @@ namespace range_sensor_multi_zone
 
         if (diag_verbose_) {
             RCLCPP_INFO(this->get_logger(), "Sensor %d: Created point cloud with %zu points (max_z: %f, min_z: %f, min_distance_mm: %d)",
-                       sensor_id, sensor_pointclouds_[sensor_id].width, max_z, min_z, min_distance_mm);
+                       sensor_id, (size_t)sensor_pointclouds_[sensor_id].width, max_z, min_z, min_distance_mm);
         }
     }
 
@@ -380,32 +402,120 @@ namespace range_sensor_multi_zone
         // Update combined point cloud properties
         combined_cloud.width = combined_cloud.data.size() / 16; // 16 bytes per point
 
-        // Apply radius outlier filter using PCL
-        if (combined_cloud.width > 0) {
-            // Convert to PCL for filtering
-            pcl::PointCloud<pcl::PointXYZI>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZI>);
+        // Convert to PCL once for all filtering operations
+        pcl::PointCloud<pcl::PointXYZI>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZI>);
+        if (combined_cloud.width > 0 && (radius_outlier_enabled_ || temporal_filter_enabled_)) {
             pcl::fromROSMsg(combined_cloud, *pcl_cloud);
 
-            // Apply radius outlier removal
-            pcl::PointCloud<pcl::PointXYZI>::Ptr filtered_cloud(new pcl::PointCloud<pcl::PointXYZI>);
-            pcl::RadiusOutlierRemoval<pcl::PointXYZI> radius_outlier_removal;
-            
-            radius_outlier_removal.setInputCloud(pcl_cloud);
-            radius_outlier_removal.setRadiusSearch(radius_outlier_radius_);
-            radius_outlier_removal.setMinNeighborsInRadius(radius_outlier_min_neighbors_);
-            radius_outlier_removal.filter(*filtered_cloud);
+            // Apply temporal moving average filter first (if enabled)
+            if (temporal_filter_enabled_) {
+                pcl_cloud = apply_temporal_filter(pcl_cloud);
+            }
 
-            // Convert back to ROS2 point cloud
-            pcl::toROSMsg(*filtered_cloud, combined_cloud);
+            // Apply radius outlier filter after temporal (if enabled)
+            if (radius_outlier_enabled_) {
+                pcl::PointCloud<pcl::PointXYZI>::Ptr filtered_cloud(new pcl::PointCloud<pcl::PointXYZI>);
+                pcl::RadiusOutlierRemoval<pcl::PointXYZI> radius_outlier_removal;
+                
+                radius_outlier_removal.setInputCloud(pcl_cloud);
+                radius_outlier_removal.setRadiusSearch(radius_outlier_radius_);
+                radius_outlier_removal.setMinNeighborsInRadius(radius_outlier_min_neighbors_);
+                radius_outlier_removal.filter(*filtered_cloud);
+                
+                pcl_cloud = filtered_cloud;
+            }
+
+            // Convert back to ROS2 message once
+            sensor_msgs::msg::PointCloud2 output_cloud;
+            pcl::toROSMsg(*pcl_cloud, output_cloud);
+            output_cloud.header = combined_cloud.header;
+
+            // Publish filtered combined point cloud
+            combined_pointcloud_publisher_->publish(output_cloud);
+
+            if (diag_verbose_) {
+                RCLCPP_DEBUG(this->get_logger(), "Published combined point cloud with %zu points",
+                           pcl_cloud->points.size());
+            }
+        } else {
+            // No filtering, publish as-is
+            combined_pointcloud_publisher_->publish(combined_cloud);
+
+            if (diag_verbose_) {
+                RCLCPP_DEBUG(this->get_logger(), "Published combined point cloud with %zu points",
+                           (size_t)combined_cloud.width);
+            }
+        }
+    }
+
+    pcl::PointCloud<pcl::PointXYZI>::Ptr RangeSensorMultiZone::apply_temporal_filter(const pcl::PointCloud<pcl::PointXYZI>::Ptr& input_cloud)
+    {
+        // Add current cloud to buffer
+        pointcloud_buffer_.push_back(input_cloud);
+
+        // Keep only the last N frames
+        if (pointcloud_buffer_.size() > static_cast<size_t>(temporal_filter_size_)) {
+            pointcloud_buffer_.erase(pointcloud_buffer_.begin());
         }
 
-        // Publish filtered combined point cloud
-        combined_pointcloud_publisher_->publish(combined_cloud);
+        // If buffer is not full yet, just return the current cloud
+        if (pointcloud_buffer_.size() < static_cast<size_t>(temporal_filter_size_)) {
+            return input_cloud;
+        }
+
+        // Create averaged point cloud
+        pcl::PointCloud<pcl::PointXYZI>::Ptr averaged_cloud(new pcl::PointCloud<pcl::PointXYZI>);
+
+        // For simplicity, we'll average all points from all frames
+        // A more sophisticated approach would use nearest neighbor matching
+        std::map<std::tuple<int, int, int>, std::vector<pcl::PointXYZI>> voxel_map;
+
+        // Voxelize points from all frames (10mm voxels for grouping)
+        float voxel_size = 0.01f; // 10mm
+        for (const auto& cloud : pointcloud_buffer_) {
+            for (const auto& point : cloud->points) {
+                int vx = static_cast<int>(point.x / voxel_size);
+                int vy = static_cast<int>(point.y / voxel_size);
+                int vz = static_cast<int>(point.z / voxel_size);
+                voxel_map[std::make_tuple(vx, vy, vz)].push_back(point);
+            }
+        }
+
+        // Average points in each voxel
+        for (const auto& voxel : voxel_map) {
+            const auto& points = voxel.second;
+            pcl::PointXYZI avg_point;
+            avg_point.x = 0;
+            avg_point.y = 0;
+            avg_point.z = 0;
+            avg_point.intensity = 0;
+
+            for (const auto& p : points) {
+                avg_point.x += p.x;
+                avg_point.y += p.y;
+                avg_point.z += p.z;
+                avg_point.intensity += p.intensity;
+            }
+
+            float count = static_cast<float>(points.size());
+            avg_point.x /= count;
+            avg_point.y /= count;
+            avg_point.z /= count;
+            avg_point.intensity /= count;
+
+            averaged_cloud->points.push_back(avg_point);
+        }
+
+        averaged_cloud->width = averaged_cloud->points.size();
+        averaged_cloud->height = 1;
+        averaged_cloud->is_dense = true;
 
         if (diag_verbose_) {
-            RCLCPP_DEBUG(this->get_logger(), "Published combined point cloud with %zu points",
-                       combined_cloud.width);
+            RCLCPP_DEBUG(this->get_logger(), "Temporal filter: %zu frames, %zu -> %zu points",
+                       pointcloud_buffer_.size(), input_cloud->points.size(), averaged_cloud->points.size());
         }
+
+        return averaged_cloud;
     }
 
     bool RangeSensorMultiZone::is_sensor_enabled(int sensor_id) const

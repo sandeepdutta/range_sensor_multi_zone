@@ -12,17 +12,21 @@ def generate_launch_description():
                         parameters=[{'i2c_adapter_nr': 7,
                                      'num_sensors': 8,
                                      'resolution': 8, # 8x8, 4 = 4x4
-                                     'ranging_frequency_hz': 10,
-                                     'diag_verbose': False,
-                                     'max_height': 0.075,
-                                     'min_height': -0.2,
-                                     'min_distance': 50,
+                                     'ranging_frequency_hz': 15,
+                                     'max_height': 0.15,
+                                     'min_height': 0.0,
+                                     'min_distance': 250,
                                      'max_distance': 1000,
+                                     'range_sigma_threshold': 100,
+                                     'radius_outlier_enabled': True,
                                      'radius_outlier_radius': 0.1,
-                                     'radius_outlier_min_neighbors': 12,
+                                     'radius_outlier_min_neighbors': 15,
+                                     'temporal_filter_enabled': True,
+                                     'temporal_filter_size': 2,
                                      'sensor_mask': 0x00, # 0x00 = all sensors enabled, 0xaa corner sensors enabled
-                                     'horizontal_fov': 15.0, # degrees
+                                     'horizontal_fov': 11.25, #45.0, # degrees
                                      'vertical_fov': 45.0, # degrees
+                                     'sharpener_percent': 25, # 
                                      'diag_verbose': False,
                                      'frame_ids': ['RF_45_TOF',
                                                    'RF_90_TOF',
