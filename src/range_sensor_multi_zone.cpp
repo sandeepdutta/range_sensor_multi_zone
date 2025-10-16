@@ -31,6 +31,7 @@ namespace range_sensor_multi_zone
         radius_outlier_min_neighbors_ = this->declare_parameter("radius_outlier_min_neighbors", 3);
         temporal_filter_enabled_ = this->declare_parameter("temporal_filter_enabled", false);
         temporal_filter_size_ = this->declare_parameter("temporal_filter_size", 3);
+        temporal_filter_alpha_ = this->declare_parameter("temporal_filter_alpha", 0.3);
         sensor_mask_ = this->declare_parameter("sensor_mask", 0); // 0 = all sensors enabled
         horizontal_fov_ = this->declare_parameter("horizontal_fov", 53.0); // degrees
         vertical_fov_ = this->declare_parameter("vertical_fov", 45.0); // degrees
@@ -49,6 +50,7 @@ namespace range_sensor_multi_zone
         RCLCPP_INFO(this->get_logger(), "Radius outlier min neighbors: %d", radius_outlier_min_neighbors_);
         RCLCPP_INFO(this->get_logger(), "Temporal filter enabled: %s", temporal_filter_enabled_ ? "true" : "false");
         RCLCPP_INFO(this->get_logger(), "Temporal filter size: %d frames", temporal_filter_size_);
+        RCLCPP_INFO(this->get_logger(), "Temporal filter alpha: %f", temporal_filter_alpha_);
         RCLCPP_INFO(this->get_logger(), "Sensor mask: 0x%02X", sensor_mask_);
         RCLCPP_INFO(this->get_logger(), "Horizontal FOV: %f degrees", horizontal_fov_);
         RCLCPP_INFO(this->get_logger(), "Vertical FOV: %f degrees", vertical_fov_);
@@ -294,7 +296,7 @@ namespace range_sensor_multi_zone
                 
                 // Convert to ROS coordinate system: X forward, Y left, Z up
                 float x = sensor_z;   // Forward
-                float y = sensor_x;   // Left
+                float y = -sensor_x;   // Left
                 float z = -sensor_y;  // Up (negative because sensor Y is down)
                 
                 if (z > max_z) max_z = z;
@@ -463,47 +465,53 @@ namespace range_sensor_multi_zone
             return input_cloud;
         }
 
-        // Create averaged point cloud
+        // Create exponentially averaged point cloud
         pcl::PointCloud<pcl::PointXYZI>::Ptr averaged_cloud(new pcl::PointCloud<pcl::PointXYZI>);
 
-        // For simplicity, we'll average all points from all frames
-        // A more sophisticated approach would use nearest neighbor matching
-        std::map<std::tuple<int, int, int>, std::vector<pcl::PointXYZI>> voxel_map;
+        // Use exponential moving average with alpha parameter
+        // For each voxel, apply: new_value = alpha * current_value + (1-alpha) * previous_value
+        std::map<std::tuple<int, int, int>, pcl::PointXYZI> voxel_map;
 
         // Voxelize points from all frames (10mm voxels for grouping)
         float voxel_size = 0.01f; // 10mm
-        for (const auto& cloud : pointcloud_buffer_) {
+        
+        // Process frames in chronological order (oldest first)
+        for (size_t frame_idx = 0; frame_idx < pointcloud_buffer_.size(); frame_idx++) {
+            const auto& cloud = pointcloud_buffer_[frame_idx];
+            float frame_weight = (frame_idx == pointcloud_buffer_.size() - 1) ? temporal_filter_alpha_ : (1.0f - temporal_filter_alpha_);
+            
             for (const auto& point : cloud->points) {
                 int vx = static_cast<int>(point.x / voxel_size);
                 int vy = static_cast<int>(point.y / voxel_size);
                 int vz = static_cast<int>(point.z / voxel_size);
-                voxel_map[std::make_tuple(vx, vy, vz)].push_back(point);
+                auto voxel_key = std::make_tuple(vx, vy, vz);
+                
+                if (voxel_map.find(voxel_key) == voxel_map.end()) {
+                    // First occurrence of this voxel
+                    voxel_map[voxel_key] = point;
+                } else {
+                    // Apply exponential moving average
+                    auto& existing_point = voxel_map[voxel_key];
+                    if (frame_idx == pointcloud_buffer_.size() - 1) {
+                        // Current frame: exponential moving average
+                        existing_point.x = temporal_filter_alpha_ * point.x + (1.0f - temporal_filter_alpha_) * existing_point.x;
+                        existing_point.y = temporal_filter_alpha_ * point.y + (1.0f - temporal_filter_alpha_) * existing_point.y;
+                        existing_point.z = temporal_filter_alpha_ * point.z + (1.0f - temporal_filter_alpha_) * existing_point.z;
+                        existing_point.intensity = temporal_filter_alpha_ * point.intensity + (1.0f - temporal_filter_alpha_) * existing_point.intensity;
+                    } else {
+                        // Previous frames: weighted average
+                        existing_point.x = frame_weight * point.x + (1.0f - frame_weight) * existing_point.x;
+                        existing_point.y = frame_weight * point.y + (1.0f - frame_weight) * existing_point.y;
+                        existing_point.z = frame_weight * point.z + (1.0f - frame_weight) * existing_point.z;
+                        existing_point.intensity = frame_weight * point.intensity + (1.0f - frame_weight) * existing_point.intensity;
+                    }
+                }
             }
         }
 
-        // Average points in each voxel
+        // Convert map to point cloud
         for (const auto& voxel : voxel_map) {
-            const auto& points = voxel.second;
-            pcl::PointXYZI avg_point;
-            avg_point.x = 0;
-            avg_point.y = 0;
-            avg_point.z = 0;
-            avg_point.intensity = 0;
-
-            for (const auto& p : points) {
-                avg_point.x += p.x;
-                avg_point.y += p.y;
-                avg_point.z += p.z;
-                avg_point.intensity += p.intensity;
-            }
-
-            float count = static_cast<float>(points.size());
-            avg_point.x /= count;
-            avg_point.y /= count;
-            avg_point.z /= count;
-            avg_point.intensity /= count;
-
-            averaged_cloud->points.push_back(avg_point);
+            averaged_cloud->points.push_back(voxel.second);
         }
 
         averaged_cloud->width = averaged_cloud->points.size();
@@ -511,8 +519,8 @@ namespace range_sensor_multi_zone
         averaged_cloud->is_dense = true;
 
         if (diag_verbose_) {
-            RCLCPP_DEBUG(this->get_logger(), "Temporal filter: %zu frames, %zu -> %zu points",
-                       pointcloud_buffer_.size(), input_cloud->points.size(), averaged_cloud->points.size());
+            RCLCPP_DEBUG(this->get_logger(), "Temporal filter (alpha=%.2f): %zu frames, %zu -> %zu points",
+                       temporal_filter_alpha_, pointcloud_buffer_.size(), input_cloud->points.size(), averaged_cloud->points.size());
         }
 
         return averaged_cloud;

@@ -42,6 +42,7 @@ namespace range_sensor_multi_zone
             int radius_outlier_min_neighbors_;
             bool temporal_filter_enabled_;
             int temporal_filter_size_;
+            double temporal_filter_alpha_;
             uint8_t sensor_mask_;
             double horizontal_fov_;
             double vertical_fov_;

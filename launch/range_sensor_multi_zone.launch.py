@@ -13,27 +13,28 @@ def generate_launch_description():
                                      'num_sensors': 8,
                                      'resolution': 8, # 8x8, 4 = 4x4
                                      'ranging_frequency_hz': 15,
-                                     'max_height': 0.15,
-                                     'min_height': 0.0,
-                                     'min_distance': 250,
-                                     'max_distance': 1000,
+                                     'max_height': 0.25, # 150mm = 0.15m
+                                     'min_height': 0.00, # 0mm = 0m
+                                     'min_distance': 125, # 125mm = 0.125m
+                                     'max_distance': 2500, # 2500mm = 2.5m
                                      'range_sigma_threshold': 100,
                                      'radius_outlier_enabled': True,
                                      'radius_outlier_radius': 0.1,
-                                     'radius_outlier_min_neighbors': 15,
+                                     'radius_outlier_min_neighbors': 3,
                                      'temporal_filter_enabled': True,
+                                     'temporal_filter_alpha': 0.7, # new reading 70% 
                                      'temporal_filter_size': 2,
                                      'sensor_mask': 0x00, # 0x00 = all sensors enabled, 0xaa corner sensors enabled
-                                     'horizontal_fov': 11.25, #45.0, # degrees
+                                     'horizontal_fov':45.0,  # degrees
                                      'vertical_fov': 45.0, # degrees
                                      'sharpener_percent': 25, # 
                                      'diag_verbose': False,
-                                     'frame_ids': ['RF_45_TOF',
-                                                   'RF_90_TOF',
-                                                   'LF_45_TOF',
-                                                   'LF_90_TOF',
-                                                   'LB_45_TOF',
-                                                   'LB_90_TOF',
-                                                   'RB_45_TOF',
-                                                   'RB_90_TOF']}]
+                                     'frame_ids': ['RFS_TOF',
+                                                   'RFF_TOF',
+                                                   'LFS_TOF',
+                                                   'LFF_TOF',
+                                                   'LBS_TOF',
+                                                   'LBB_TOF',
+                                                   'RBS_TOF',
+                                                   'RBB_TOF']}]
                                 )])
