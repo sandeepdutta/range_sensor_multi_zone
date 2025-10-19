@@ -315,12 +315,8 @@ namespace range_sensor_multi_zone
                 memcpy(data_ptr + 4, &y, 4);
                 memcpy(data_ptr + 8, &z, 4);
                 
-                // Use signal strength as intensity if available
-                #ifndef VL53L5CX_DISABLE_SIGNAL_PER_SPAD
-                float intensity = static_cast<float>(results.signal_per_spad[target_idx]);
-                #else
-                float intensity = 255.0f; // Default intensity
-                #endif
+                // Use range sigma as intensity
+                float intensity = static_cast<float>(range_sigma_mm);
                 memcpy(data_ptr + 12, &intensity, 4);
             }
         }
