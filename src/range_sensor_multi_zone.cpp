@@ -108,17 +108,33 @@ namespace range_sensor_multi_zone
                 return;
             }
 
-	        // Check if there is a VL53L5CX sensor connected
+	        // Check if there is a VL53L5CX sensor connected (retry up to 3 times)
             uint8_t isAlive = 0;
-	        if (vl53l5cx_is_alive(&configuration_, &isAlive) != 0) {
-                    RCLCPP_ERROR(this->get_logger(), "Failed check if sensor %d is alive %s", i, strerror(errno));
+            bool sensor_alive = false;
+            for (int retry = 0; retry < 3; retry++) {
+                if (vl53l5cx_is_alive(&configuration_, &isAlive) != 0) {
+                    RCLCPP_WARN(this->get_logger(), "Failed check if sensor %d is alive (attempt %d/3): %s",
+                                i, retry + 1, strerror(errno));
+                    if (retry < 2) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        continue;
+                    }
+                    RCLCPP_ERROR(this->get_logger(), "Failed check if sensor %d is alive after 3 attempts", i);
                     rclcpp::shutdown();
                     return;
-            }
-            if (!isAlive) {
-                RCLCPP_ERROR(this->get_logger(), "Sensor %d is not alive", i);
-                rclcpp::shutdown();
-                return;
+                }
+                if (!isAlive) {
+                    RCLCPP_WARN(this->get_logger(), "Sensor %d is not alive (attempt %d/3)", i, retry + 1);
+                    if (retry < 2) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        continue;
+                    }
+                    RCLCPP_ERROR(this->get_logger(), "Sensor %d is not alive after 3 attempts", i);
+                    rclcpp::shutdown();
+                    return;
+                }
+                sensor_alive = true;
+                break;
             }
             RCLCPP_INFO(this->get_logger(), "Sensor %d is alive .. loading firmware", i);
             uint8_t status = vl53l5cx_init(&configuration_);
