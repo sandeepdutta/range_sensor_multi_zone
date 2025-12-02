@@ -71,6 +71,9 @@ namespace range_sensor_multi_zone
         // Initialize combined point cloud publisher
         combined_pointcloud_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("range_pointcloud", 10);
 
+        // Initialize laser scan publisher
+        laserscan_publisher_ = this->create_publisher<sensor_msgs::msg::LaserScan>("range_scan", 10);
+
         // Initialize individual point cloud publishers
         pointcloud_publishers_.resize(num_sensors_);
         for (int i = 0; i < num_sensors_; i++) {
@@ -81,14 +84,69 @@ namespace range_sensor_multi_zone
         tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
+        // Subscribe to odometry topic to get timestamps
+        odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+            "/odom", 10,
+            std::bind(&RangeSensorMultiZone::odom_callback, this, std::placeholders::_1));
+
         // Initialize ROS2 point cloud for each sensor
         sensor_pointclouds_.resize(num_sensors_);
+
+        // Initialize sensor read tracking for diagnostics
+        sensor_read_counts_.resize(num_sensors_, 0);
+        last_sensor_read_counts_.resize(num_sensors_, 0);
+        last_sensor_read_change_times_.resize(num_sensors_, this->now());
+        last_diagnostic_check_time_ = this->now();
+
+        // Initialize diagnostic updater
+        diagnostic_updater_ = std::make_unique<diagnostic_updater::Updater>(this);
+        diagnostic_updater_->setHardwareID("Range Sensor Multi Zone");
+        diagnostic_updater_->add("Sensor Status", this, &RangeSensorMultiZone::diagnostic_callback);
+
+        // Create timer to periodically update diagnostics (1 Hz) if not verbose
+        if (!diag_verbose_) {
+            diagnostic_timer_ = this->create_wall_timer(
+                std::chrono::seconds(1),
+                [this]() {
+                    if (diagnostic_updater_) {
+                        diagnostic_updater_->force_update();
+                    }
+                });
+        }
 
         init_sensor();
 
         RCLCPP_INFO(this->get_logger(), "RangeSensorMultiZone constructor done");
     }
 
+    RangeSensorMultiZone::~RangeSensorMultiZone()
+    {
+        // Stop ranging for all sensors
+        if (configuration_.platform.i2c_hdl >= 0) {
+            for (int i = 0; i < num_sensors_; i++) {
+                // Skip disabled sensors
+                if (!is_sensor_enabled(i)) {
+                    continue;
+                }
+
+                // Select the sensor
+                if (VL53L5CX_Sensor_Select(&configuration_.platform, i, VL53L5CX_DEFAULT_I2C_ADDRESS) == 0) {
+                    // Stop ranging for this sensor
+                    if (vl53l5cx_stop_ranging(&configuration_) == 0) {
+                        RCLCPP_INFO(this->get_logger(), "Stopped ranging for sensor %d", i);
+                    } else {
+                        RCLCPP_WARN(this->get_logger(), "Failed to stop ranging for sensor %d", i);
+                    }
+                } else {
+                    RCLCPP_WARN(this->get_logger(), "Failed to select sensor %d for cleanup", i);
+                }
+            }
+
+            // Close I2C handle
+            close(configuration_.platform.i2c_hdl);
+            RCLCPP_INFO(this->get_logger(), "Closed I2C adapter %d", i2c_adapter_nr_);
+        }
+    }
 
     void RangeSensorMultiZone::init_sensor()
     {
@@ -206,6 +264,9 @@ namespace range_sensor_multi_zone
                     continue;
                 }
 
+                // Increment sensor read count for diagnostics
+                sensor_read_counts_[i]++;
+
                 // Only convert to point cloud if sensor is enabled
                 if (is_sensor_enabled(i)) {
                     convert_to_pointcloud(i, results);
@@ -215,9 +276,14 @@ namespace range_sensor_multi_zone
                     }
                 }
             }
-            
+
             // Combine all sensor point clouds and transform to base_link
             combine_and_transform_pointclouds();
+
+            // Update diagnostics if verbose mode is enabled
+            if (diag_verbose_ && diagnostic_updater_) {
+                diagnostic_updater_->force_update();
+            }
     }
 
 
@@ -360,7 +426,17 @@ namespace range_sensor_multi_zone
     {
         // Create combined point cloud
         sensor_msgs::msg::PointCloud2 combined_cloud;
-        combined_cloud.header.stamp = this->get_clock()->now();
+
+        // Use odometry timestamp if available, otherwise use current time
+        {
+            std::lock_guard<std::mutex> lock(odom_mutex_);
+            if (latest_odom_stamp_.sec != 0 || latest_odom_stamp_.nanosec != 0) {
+                combined_cloud.header.stamp = latest_odom_stamp_;
+            } else {
+                combined_cloud.header.stamp = this->get_clock()->now();
+            }
+        }
+
         combined_cloud.header.frame_id = "base_link";
         combined_cloud.height = 1;
         combined_cloud.is_dense = true;
@@ -447,16 +523,30 @@ namespace range_sensor_multi_zone
             // Publish filtered combined point cloud
             combined_pointcloud_publisher_->publish(output_cloud);
 
+            // Convert to laser scan and publish only if there are subscribers
+            if (laserscan_publisher_->get_subscription_count() > 0) {
+                auto laser_scan = pointcloud_to_laserscan(pcl_cloud, output_cloud.header);
+                laserscan_publisher_->publish(laser_scan);
+            }
+
             if (diag_verbose_) {
-                RCLCPP_DEBUG(this->get_logger(), "Published combined point cloud with %zu points",
+                RCLCPP_DEBUG(this->get_logger(), "Published combined point cloud with %zu points and laser scan",
                            pcl_cloud->points.size());
             }
         } else {
             // No filtering, publish as-is
             combined_pointcloud_publisher_->publish(combined_cloud);
 
+            // Convert to PCL for laser scan generation only if there are subscribers
+            if (laserscan_publisher_->get_subscription_count() > 0 && combined_cloud.width > 0) {
+                pcl::PointCloud<pcl::PointXYZI>::Ptr temp_cloud(new pcl::PointCloud<pcl::PointXYZI>);
+                pcl::fromROSMsg(combined_cloud, *temp_cloud);
+                auto laser_scan = pointcloud_to_laserscan(temp_cloud, combined_cloud.header);
+                laserscan_publisher_->publish(laser_scan);
+            }
+
             if (diag_verbose_) {
-                RCLCPP_DEBUG(this->get_logger(), "Published combined point cloud with %zu points",
+                RCLCPP_DEBUG(this->get_logger(), "Published combined point cloud with %zu points and laser scan",
                            (size_t)combined_cloud.width);
             }
         }
@@ -538,6 +628,62 @@ namespace range_sensor_multi_zone
         return averaged_cloud;
     }
 
+    sensor_msgs::msg::LaserScan RangeSensorMultiZone::pointcloud_to_laserscan(const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud, const std_msgs::msg::Header& header)
+    {
+        sensor_msgs::msg::LaserScan scan;
+        scan.header = header;
+
+        // LaserScan parameters - full 360 degree coverage
+        scan.angle_min = -M_PI;  // -180 degrees
+        scan.angle_max = M_PI;   // +180 degrees
+        scan.angle_increment = 0.5 * M_PI / 180.0;  // 0.5 degree resolution
+        scan.time_increment = 0.0;
+        scan.scan_time = 0.0;
+        scan.range_min = min_distance_ / 1000.0;  // Convert mm to meters
+        scan.range_max = max_distance_ / 1000.0;  // Convert mm to meters
+
+        // Calculate number of beams
+        int num_beams = static_cast<int>((scan.angle_max - scan.angle_min) / scan.angle_increment) + 1;
+        scan.ranges.resize(num_beams, std::numeric_limits<float>::infinity());
+        scan.intensities.resize(num_beams, 0.0);
+
+        // For 3D scan support, we'll project all points within the height range onto a 2D plane
+        // and keep the closest point for each angle
+        for (const auto& point : cloud->points) {
+            // Check if point is within valid height range (this allows vertical 3D coverage)
+            if (point.z < min_height_ || point.z > max_height_) {
+                continue;
+            }
+
+            // Calculate angle from x,y coordinates (horizontal angle)
+            float angle = atan2(point.y, point.x);
+
+            // Calculate horizontal range (2D distance in x-y plane)
+            float range = sqrt(point.x * point.x + point.y * point.y);
+
+            // Check if range is valid
+            if (range < scan.range_min || range > scan.range_max) {
+                continue;
+            }
+
+            // Calculate beam index
+            int beam_index = static_cast<int>((angle - scan.angle_min) / scan.angle_increment);
+
+            // Check if beam index is valid
+            if (beam_index < 0 || beam_index >= num_beams) {
+                continue;
+            }
+
+            // Keep closest point for each beam (this projects 3D data to 2D scan)
+            if (range < scan.ranges[beam_index]) {
+                scan.ranges[beam_index] = range;
+                scan.intensities[beam_index] = point.intensity;
+            }
+        }
+
+        return scan;
+    }
+
     bool RangeSensorMultiZone::is_sensor_enabled(int sensor_id) const
     {
         // Check if sensor_id is within valid range
@@ -552,6 +698,100 @@ namespace range_sensor_multi_zone
         return !(sensor_mask_ & (1 << sensor_id));
     }
 
+    void RangeSensorMultiZone::odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
+    {
+        std::lock_guard<std::mutex> lock(odom_mutex_);
+        latest_odom_stamp_ = msg->header.stamp;
+    }
+
+    void RangeSensorMultiZone::diagnostic_callback(diagnostic_updater::DiagnosticStatusWrapper & stat)
+    {
+        // Get current time
+        rclcpp::Time current_time = this->now();
+        double time_elapsed = (current_time - last_diagnostic_check_time_).seconds();
+
+        bool sensor_warn = false;
+        bool sensor_error = false;
+        std::string message;
+        std::vector<std::string> stalled_sensors_warn;
+        std::vector<std::string> stalled_sensors_error;
+
+        // Check for sensor stalls if more than 5 seconds have passed
+        if (time_elapsed >= 5.0) {
+            // Update sensor read change times if counts have changed
+            for (int i = 0; i < num_sensors_; i++) {
+                if (sensor_read_counts_[i] != last_sensor_read_counts_[i]) {
+                    last_sensor_read_change_times_[i] = current_time;
+                    last_sensor_read_counts_[i] = sensor_read_counts_[i];
+                }
+            }
+
+            // Check each sensor for stalls (only enabled sensors)
+            for (int i = 0; i < num_sensors_; i++) {
+                if (!is_sensor_enabled(i)) {
+                    continue; // Skip disabled sensors
+                }
+
+                double sensor_stall_time = (current_time - last_sensor_read_change_times_[i]).seconds();
+
+                if (sensor_stall_time >= 30.0) {
+                    sensor_error = true;
+                    stalled_sensors_error.push_back("Sensor " + std::to_string(i) + " (" +
+                                                   std::to_string(static_cast<int>(sensor_stall_time)) + "s)");
+                } else if (sensor_stall_time >= 5.0) {
+                    sensor_warn = true;
+                    stalled_sensors_warn.push_back("Sensor " + std::to_string(i) + " (" +
+                                                   std::to_string(static_cast<int>(sensor_stall_time)) + "s)");
+                }
+            }
+
+            last_diagnostic_check_time_ = current_time;
+        }
+
+        // Build diagnostic message
+        if (sensor_error) {
+            message = "ERROR: Sensors stalled > 30s: ";
+            for (size_t i = 0; i < stalled_sensors_error.size(); i++) {
+                message += stalled_sensors_error[i];
+                if (i < stalled_sensors_error.size() - 1) message += ", ";
+            }
+            if (!stalled_sensors_warn.empty()) {
+                message += ". WARN: Sensors stalled > 5s: ";
+                for (size_t i = 0; i < stalled_sensors_warn.size(); i++) {
+                    message += stalled_sensors_warn[i];
+                    if (i < stalled_sensors_warn.size() - 1) message += ", ";
+                }
+            }
+            stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, message);
+        } else if (sensor_warn) {
+            message = "WARNING: Sensors stalled > 5s: ";
+            for (size_t i = 0; i < stalled_sensors_warn.size(); i++) {
+                message += stalled_sensors_warn[i];
+                if (i < stalled_sensors_warn.size() - 1) message += ", ";
+            }
+            stat.summary(diagnostic_msgs::msg::DiagnosticStatus::WARN, message);
+        } else {
+            stat.summary(diagnostic_msgs::msg::DiagnosticStatus::OK, "All sensors operational");
+        }
+
+        // Add sensor read counts
+        for (int i = 0; i < num_sensors_; i++) {
+            std::string sensor_key = "Sensor " + std::to_string(i) + " reads";
+            stat.add(sensor_key, static_cast<int>(sensor_read_counts_[i]));
+        }
+
+        // Add sensor configuration info
+        stat.add("Number of Sensors", num_sensors_);
+        stat.add("Sensor Mask", static_cast<int>(sensor_mask_));
+        stat.add("Resolution", std::to_string(resolution_) + "x" + std::to_string(resolution_));
+        stat.add("Ranging Frequency", std::to_string(ranging_frequency_hz_) + " Hz");
+        stat.add("Min Distance", std::to_string(min_distance_) + " mm");
+        stat.add("Max Distance", std::to_string(max_distance_) + " mm");
+        stat.add("Min Height", std::to_string(min_height_) + " m");
+        stat.add("Max Height", std::to_string(max_height_) + " m");
+        stat.add("Radius Outlier Filter", radius_outlier_enabled_ ? "Enabled" : "Disabled");
+        stat.add("Temporal Filter", temporal_filter_enabled_ ? "Enabled" : "Disabled");
+    }
 
 }
 

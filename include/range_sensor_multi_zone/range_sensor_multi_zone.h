@@ -3,7 +3,11 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/laser_scan.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <diagnostic_updater/diagnostic_updater.hpp>
+#include <diagnostic_updater/publisher.hpp>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
 #include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
@@ -17,6 +21,7 @@
 #include <range_sensor_multi_zone/vl53l5cx_plugin_detection_thresholds.h>
 #include <range_sensor_multi_zone/vl53l5cx_plugin_motion_indicator.h>
 #include <range_sensor_multi_zone/vl53l5cx_plugin_xtalk.h>
+#include <mutex>
 
 namespace range_sensor_multi_zone
 {
@@ -24,7 +29,7 @@ namespace range_sensor_multi_zone
     {
         public:
             explicit RangeSensorMultiZone();
-            ~RangeSensorMultiZone() = default;
+            ~RangeSensorMultiZone();
 
         private:
             int i2c_adapter_nr_;
@@ -54,11 +59,25 @@ namespace range_sensor_multi_zone
             VL53L5CX_Configuration configuration_;
             rclcpp::TimerBase::SharedPtr timer_;
             rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr combined_pointcloud_publisher_;
+            rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr laserscan_publisher_;
             std::vector<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr> pointcloud_publishers_;
+            rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
             std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
             std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
             std::vector<sensor_msgs::msg::PointCloud2> sensor_pointclouds_;
             std::vector<pcl::PointCloud<pcl::PointXYZI>::Ptr> pointcloud_buffer_;
+            std::mutex odom_mutex_;
+            builtin_interfaces::msg::Time latest_odom_stamp_;
+
+            // Diagnostic updater
+            std::unique_ptr<diagnostic_updater::Updater> diagnostic_updater_;
+            rclcpp::TimerBase::SharedPtr diagnostic_timer_;
+
+            // Sensor read tracking for diagnostics
+            std::vector<uint64_t> sensor_read_counts_;
+            std::vector<uint64_t> last_sensor_read_counts_;
+            std::vector<rclcpp::Time> last_sensor_read_change_times_;
+            rclcpp::Time last_diagnostic_check_time_;
 
             void init_sensor();
             void timer_callback();
@@ -66,7 +85,10 @@ namespace range_sensor_multi_zone
             void convert_to_pointcloud(int sensor_id, const VL53L5CX_ResultsData& results);
             void combine_and_transform_pointclouds();
             pcl::PointCloud<pcl::PointXYZI>::Ptr apply_temporal_filter(const pcl::PointCloud<pcl::PointXYZI>::Ptr& input_cloud);
+            sensor_msgs::msg::LaserScan pointcloud_to_laserscan(const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud, const std_msgs::msg::Header& header);
             bool is_sensor_enabled(int sensor_id) const;
+            void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg);
+            void diagnostic_callback(diagnostic_updater::DiagnosticStatusWrapper & stat);
     };
 }
 #endif
