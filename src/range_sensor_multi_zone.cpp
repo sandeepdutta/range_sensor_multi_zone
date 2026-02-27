@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <cmath>
 #include <cerrno>
+#include <chrono>
 #include <tf2/LinearMath/Transform.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include "range_sensor_multi_zone/range_sensor_multi_zone.h"
@@ -37,6 +38,7 @@ namespace range_sensor_multi_zone
         vertical_fov_ = this->declare_parameter("vertical_fov", 45.0); // degrees
         sharpener_percent_ = this->declare_parameter("sharpener_percent", 14); // default value from sensor
         range_sigma_threshold_ = this->declare_parameter("range_sigma_threshold", 20); // mm
+        target_status_filter_ = this->declare_parameter("target_status_filter", 5); // 5=valid only, 2+=accept merged targets, 0+=accept all
         ranging_frequency_hz_ = this->declare_parameter("ranging_frequency_hz", 10);
         timer_period_ = 1000 / ranging_frequency_hz_; // in milliseconds
         // add 10% margin
@@ -57,6 +59,7 @@ namespace range_sensor_multi_zone
         RCLCPP_INFO(this->get_logger(), "Resolution: %dx%d", resolution_, resolution_);
         RCLCPP_INFO(this->get_logger(), "Sharpener percent: %d%%", sharpener_percent_);
         RCLCPP_INFO(this->get_logger(), "Range sigma threshold: %d mm", range_sigma_threshold_);
+        RCLCPP_INFO(this->get_logger(), "Target status filter: %d (5=valid only, 2+=merged targets OK, 0+=accept all)", target_status_filter_);
         frame_ids_topic_names_ = this->declare_parameter("frame_ids", std::vector<std::string>{"Sensor_0", 
                                                                                                "Sensor_1", 
                                                                                                "Sensor_2", 
@@ -95,8 +98,27 @@ namespace range_sensor_multi_zone
         // Initialize sensor read tracking for diagnostics
         sensor_read_counts_.resize(num_sensors_, 0);
         last_sensor_read_counts_.resize(num_sensors_, 0);
+        // Initialize min/max tracking with extreme values
+        sensor_min_x_.resize(num_sensors_, std::numeric_limits<float>::max());
+        sensor_max_x_.resize(num_sensors_, 0);
+        sensor_min_y_.resize(num_sensors_, std::numeric_limits<float>::max());
+        sensor_max_y_.resize(num_sensors_, 0);
+        sensor_min_z_.resize(num_sensors_, std::numeric_limits<float>::max());
+        sensor_max_z_.resize(num_sensors_, 0);
+        // Initialize range sigma tracking
+        sensor_min_sigma_mm_.resize(num_sensors_, std::numeric_limits<uint16_t>::max());
+        sensor_max_sigma_mm_.resize(num_sensors_, 0);
         last_sensor_read_change_times_.resize(num_sensors_, this->now());
         last_diagnostic_check_time_ = this->now();
+
+        // Initialize timing tracking
+        sensor_read_times_ms_.resize(num_sensors_, 0);
+        sensor_convert_times_ms_.resize(num_sensors_, 0);
+        sensor_tf_times_ms_.resize(num_sensors_, 0);
+        combine_transform_time_ms_ = 0;
+        timer_callback_time_ms_ = 0;
+        temporal_filter_time_ms_ = 0;
+        radius_filter_time_ms_ = 0;
 
         // Initialize diagnostic updater
         diagnostic_updater_ = std::make_unique<diagnostic_updater::Updater>(this);
@@ -168,7 +190,6 @@ namespace range_sensor_multi_zone
 
 	        // Check if there is a VL53L5CX sensor connected (retry up to 3 times)
             uint8_t isAlive = 0;
-            bool sensor_alive = false;
             for (int retry = 0; retry < 3; retry++) {
                 if (vl53l5cx_is_alive(&configuration_, &isAlive) != 0) {
                     RCLCPP_WARN(this->get_logger(), "Failed check if sensor %d is alive (attempt %d/3): %s",
@@ -191,7 +212,6 @@ namespace range_sensor_multi_zone
                     rclcpp::shutdown();
                     return;
                 }
-                sensor_alive = true;
                 break;
             }
             RCLCPP_INFO(this->get_logger(), "Sensor %d is alive .. loading firmware", i);
@@ -241,8 +261,15 @@ namespace range_sensor_multi_zone
 
     void RangeSensorMultiZone::timer_callback()
     {
+            auto timer_start = std::chrono::high_resolution_clock::now();
+
+            // Capture timestamp at the start of callback for synchronized publishing
+            rclcpp::Time callback_timestamp = this->get_clock()->now();
+
             // Loop over the sensors
             for (int i = 0; i < num_sensors_; i++) {
+                auto read_start = std::chrono::high_resolution_clock::now();
+
                 // Select the Sensor
                 if (VL53L5CX_Sensor_Select(&configuration_.platform, i, VL53L5CX_DEFAULT_I2C_ADDRESS) != 0) {
                     RCLCPP_ERROR(this->get_logger(), "Failed to select sensor %d", i);
@@ -253,45 +280,68 @@ namespace range_sensor_multi_zone
                 uint8_t isReady = 0;
                 if (vl53l5cx_check_data_ready(&configuration_, &isReady) != 0) {
                     RCLCPP_ERROR(this->get_logger(), "Failed to check if sensor %d is ready", i);
+                    sensor_read_times_ms_[i] = 0;  // Reset on error
                     continue;
                 }
-                if (!isReady) continue;
+                if (!isReady) {
+                    sensor_read_times_ms_[i] = 0;  // Reset if not ready
+                    continue;
+                }
 
                 // Get the data
                 VL53L5CX_ResultsData results;
                 if (vl53l5cx_get_ranging_data(&configuration_, &results) != 0) {
                     RCLCPP_ERROR(this->get_logger(), "Failed to get data for sensor %d", i);
+                    sensor_read_times_ms_[i] = 0;  // Reset on error
                     continue;
                 }
+
+                auto read_end = std::chrono::high_resolution_clock::now();
+                sensor_read_times_ms_[i] = std::chrono::duration_cast<std::chrono::milliseconds>(read_end - read_start).count();
 
                 // Increment sensor read count for diagnostics
                 sensor_read_counts_[i]++;
 
-                // Only convert to point cloud if sensor is enabled
-                if (is_sensor_enabled(i)) {
-                    convert_to_pointcloud(i, results);
-                } else {
-                    if (diag_verbose_) {
-                        RCLCPP_DEBUG(this->get_logger(), "Sensor %d data read but skipped point cloud conversion (masked out)", i);
+                // Get the latest odometry timestamp at time of reading
+                rclcpp::Time sensor_odom_timestamp;
+                {
+                    std::lock_guard<std::mutex> lock(odom_mutex_);
+                    if (latest_odom_stamp_.sec != 0 || latest_odom_stamp_.nanosec != 0) {
+                        sensor_odom_timestamp = latest_odom_stamp_;
+                    } else {
+                        sensor_odom_timestamp = callback_timestamp;
                     }
                 }
+
+                // Only convert to point cloud if sensor is enabled
+                if (is_sensor_enabled(i)) {
+                    convert_to_pointcloud(i, results, sensor_odom_timestamp);
+                } 
             }
 
             // Combine all sensor point clouds and transform to base_link
-            combine_and_transform_pointclouds();
+            auto combine_start = std::chrono::high_resolution_clock::now();
+            combine_and_transform_pointclouds(callback_timestamp);
+            auto combine_end = std::chrono::high_resolution_clock::now();
+            combine_transform_time_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(combine_end - combine_start).count();
 
             // Update diagnostics if verbose mode is enabled
             if (diag_verbose_ && diagnostic_updater_) {
                 diagnostic_updater_->force_update();
             }
+
+            auto timer_end = std::chrono::high_resolution_clock::now();
+            timer_callback_time_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(timer_end - timer_start).count();
     }
 
 
-    void RangeSensorMultiZone::convert_to_pointcloud(int sensor_id, const VL53L5CX_ResultsData& results)
+    void RangeSensorMultiZone::convert_to_pointcloud(int sensor_id, const VL53L5CX_ResultsData& results, const rclcpp::Time& timestamp)
     {
+        auto convert_start = std::chrono::high_resolution_clock::now();
+
         // Create ROS2 point cloud for this sensor
         sensor_pointclouds_[sensor_id].data.clear();
-        sensor_pointclouds_[sensor_id].header.stamp = this->get_clock()->now();
+        sensor_pointclouds_[sensor_id].header.stamp = timestamp;
         sensor_pointclouds_[sensor_id].header.frame_id = frame_ids_topic_names_[sensor_id];
         sensor_pointclouds_[sensor_id].height = 1;
         sensor_pointclouds_[sensor_id].is_dense = true;
@@ -327,8 +377,14 @@ namespace range_sensor_multi_zone
         const float vertical_fov_rad = vertical_fov_ * M_PI / 180.0f;   // Convert degrees to radians
 
         int zones = resolution_ * resolution_;
-        float max_z = 0.0f;
-        float min_z = 0.0f;
+        sensor_max_z_[sensor_id] = 0.0f;
+        sensor_min_z_[sensor_id] = std::numeric_limits<uint32_t>::max();
+        sensor_max_x_[sensor_id] = 0.0f;
+        sensor_min_x_[sensor_id] = std::numeric_limits<uint32_t>::max();
+        sensor_max_y_[sensor_id] = 0.0f;
+        sensor_min_y_[sensor_id] = std::numeric_limits<uint32_t>::max();
+        sensor_max_sigma_mm_[sensor_id] = 0;
+        sensor_min_sigma_mm_[sensor_id] = std::numeric_limits<uint16_t>::max();
         int min_distance_mm = 10000;
 
         for (int zone_id = 0; zone_id < zones; zone_id++) {
@@ -358,11 +414,15 @@ namespace range_sensor_multi_zone
                 uint8_t target_status = results.target_status[target_idx];
                 uint16_t range_sigma_mm = results.range_sigma_mm[target_idx];
                 // Skip invalid measurements
-                if (distance_mm <= min_distance_ || 
+                if (distance_mm <= min_distance_ ||
                     distance_mm > max_distance_ ||
                     range_sigma_mm > range_sigma_threshold_ ||
-                    target_status != 5) continue;
-                
+                    target_status < target_status_filter_) continue;
+
+                // Track range sigma min/max
+                if (range_sigma_mm < sensor_min_sigma_mm_[sensor_id]) sensor_min_sigma_mm_[sensor_id] = range_sigma_mm;
+                if (range_sigma_mm > sensor_max_sigma_mm_[sensor_id]) sensor_max_sigma_mm_[sensor_id] = range_sigma_mm;
+
                 if (distance_mm < min_distance_mm) min_distance_mm = distance_mm;
                 
                 // Convert distance from mm to meters
@@ -381,8 +441,12 @@ namespace range_sensor_multi_zone
                 float y = -sensor_x;   // Left
                 float z = -sensor_y;  // Up (negative because sensor Y is down)
                 
-                if (z > max_z) max_z = z;
-                if (z < min_z) min_z = z;
+                if (z > sensor_max_z_[sensor_id]) sensor_max_z_[sensor_id] = z;
+                if (z < sensor_min_z_[sensor_id]) sensor_min_z_[sensor_id] = z;
+                if (x > sensor_max_x_[sensor_id]) sensor_max_x_[sensor_id] = x;
+                if (x < sensor_min_x_[sensor_id]) sensor_min_x_[sensor_id] = x;
+                if (y > sensor_max_y_[sensor_id]) sensor_max_y_[sensor_id] = y;
+                if (y < sensor_min_y_[sensor_id]) sensor_min_y_[sensor_id] = y;
                 
                 // Apply height filtering - clip points outside min_height and max_height
                 if (z < min_height_ || z > max_height_) {
@@ -406,15 +470,55 @@ namespace range_sensor_multi_zone
         // Update point cloud properties
         sensor_pointclouds_[sensor_id].width = sensor_pointclouds_[sensor_id].data.size() / 16; // 16 bytes per point
 
-        // Publish individual point cloud only if there are subscribers
-        if (pointcloud_publishers_[sensor_id]->get_subscription_count() > 0) {
-            pointcloud_publishers_[sensor_id]->publish(sensor_pointclouds_[sensor_id]);
+        // Apply filtering to individual sensor point cloud
+        if (sensor_pointclouds_[sensor_id].width > 0 && (radius_outlier_enabled_ || temporal_filter_enabled_)) {
+            pcl::PointCloud<pcl::PointXYZI>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZI>);
+            pcl::fromROSMsg(sensor_pointclouds_[sensor_id], *pcl_cloud);
+
+            // Apply temporal moving average filter first (if enabled)
+            if (temporal_filter_enabled_) {
+                pcl_cloud = apply_temporal_filter(pcl_cloud);
+            }
+
+            // Apply radius outlier filter (if enabled)
+            if (radius_outlier_enabled_) {
+                pcl::PointCloud<pcl::PointXYZI>::Ptr filtered_cloud(new pcl::PointCloud<pcl::PointXYZI>);
+                pcl::RadiusOutlierRemoval<pcl::PointXYZI> radius_outlier_removal;
+
+                radius_outlier_removal.setInputCloud(pcl_cloud);
+                radius_outlier_removal.setRadiusSearch(radius_outlier_radius_);
+                radius_outlier_removal.setMinNeighborsInRadius(radius_outlier_min_neighbors_);
+                radius_outlier_removal.filter(*filtered_cloud);
+
+                pcl_cloud = filtered_cloud;
+            }
+
+            // Convert back to ROS2 message
+            pcl::toROSMsg(*pcl_cloud, sensor_pointclouds_[sensor_id]);
+            sensor_pointclouds_[sensor_id].header.stamp = timestamp;
+            sensor_pointclouds_[sensor_id].header.frame_id = frame_ids_topic_names_[sensor_id];
         }
 
-        if (diag_verbose_) {
-            RCLCPP_INFO(this->get_logger(), "Sensor %d: Created point cloud with %zu points (max_z: %f, min_z: %f, min_distance_mm: %d)",
-                       sensor_id, (size_t)sensor_pointclouds_[sensor_id].width, max_z, min_z, min_distance_mm);
+        // Transform point cloud to base_link before publishing
+        sensor_msgs::msg::PointCloud2 transformed_cloud;
+        try {
+            tf2::doTransform(sensor_pointclouds_[sensor_id], transformed_cloud,
+                           tf_buffer_->lookupTransform("base_link", frame_ids_topic_names_[sensor_id], tf2::TimePointZero));
+
+            // Publish transformed individual point cloud only if there are subscribers
+            if (pointcloud_publishers_[sensor_id]->get_subscription_count() > 0) {
+                pointcloud_publishers_[sensor_id]->publish(transformed_cloud);
+            }
+
+            // Store transformed cloud for combine operation
+            sensor_pointclouds_[sensor_id] = transformed_cloud;
+        } catch (tf2::TransformException &ex) {
+            RCLCPP_WARN(this->get_logger(), "Could not transform point cloud from %s to base_link: %s",
+                       frame_ids_topic_names_[sensor_id].c_str(), ex.what());
         }
+
+        auto convert_end = std::chrono::high_resolution_clock::now();
+        sensor_convert_times_ms_[sensor_id] = std::chrono::duration_cast<std::chrono::milliseconds>(convert_end - convert_start).count();
     }
 
     void RangeSensorMultiZone::publish_data()
@@ -422,18 +526,18 @@ namespace range_sensor_multi_zone
         RCLCPP_INFO(this->get_logger(), "RangeSensorMultiZone publish_data");
     }
 
-    void RangeSensorMultiZone::combine_and_transform_pointclouds()
+    void RangeSensorMultiZone::combine_and_transform_pointclouds(const rclcpp::Time& timestamp)
     {
         // Create combined point cloud
         sensor_msgs::msg::PointCloud2 combined_cloud;
 
-        // Use odometry timestamp if available, otherwise use current time
+        // Use odometry timestamp if available, otherwise use callback timestamp
         {
             std::lock_guard<std::mutex> lock(odom_mutex_);
             if (latest_odom_stamp_.sec != 0 || latest_odom_stamp_.nanosec != 0) {
                 combined_cloud.header.stamp = latest_odom_stamp_;
             } else {
-                combined_cloud.header.stamp = this->get_clock()->now();
+                combined_cloud.header.stamp = timestamp;
             }
         }
 
@@ -466,90 +570,31 @@ namespace range_sensor_multi_zone
         combined_cloud.point_step = 16; // 4 fields * 4 bytes each
         combined_cloud.row_step = 0;
 
-        // Combine all sensor point clouds
+        // Combine all sensor point clouds (already transformed to base_link in convert_to_pointcloud)
         for (int i = 0; i < num_sensors_; i++) {
             // Skip sensor if masked out or no data
             if (!is_sensor_enabled(i) || sensor_pointclouds_[i].data.empty()) continue;
 
-            try {
-                // Transform the point cloud from sensor frame to base_link
-                sensor_msgs::msg::PointCloud2 transformed_cloud;
-                tf2::doTransform(sensor_pointclouds_[i], transformed_cloud, 
-                               tf_buffer_->lookupTransform("base_link", frame_ids_topic_names_[i], tf2::TimePointZero));
-
-                // Concatenate point clouds
-                combined_cloud.data.insert(combined_cloud.data.end(), 
-                                         transformed_cloud.data.begin(), 
-                                         transformed_cloud.data.end());
-
-            } catch (tf2::TransformException &ex) {
-                RCLCPP_WARN(this->get_logger(), "Could not transform point cloud from %s to base_link: %s",
-                           frame_ids_topic_names_[i].c_str(), ex.what());
-                continue;
-            }
+            // Concatenate already-transformed point clouds
+            combined_cloud.data.insert(combined_cloud.data.end(),
+                                     sensor_pointclouds_[i].data.begin(),
+                                     sensor_pointclouds_[i].data.end());
         }
 
         // Update combined point cloud properties
         combined_cloud.width = combined_cloud.data.size() / 16; // 16 bytes per point
 
-        // Convert to PCL once for all filtering operations
-        pcl::PointCloud<pcl::PointXYZI>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZI>);
-        if (combined_cloud.width > 0 && (radius_outlier_enabled_ || temporal_filter_enabled_)) {
+        // Publish combined point cloud (already filtered at individual sensor level)
+        combined_pointcloud_publisher_->publish(combined_cloud);
+
+        // Convert to PCL for laser scan generation only if there are subscribers
+        if (laserscan_publisher_->get_subscription_count() > 0 && combined_cloud.width > 0) {
+            pcl::PointCloud<pcl::PointXYZI>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZI>);
             pcl::fromROSMsg(combined_cloud, *pcl_cloud);
-
-            // Apply temporal moving average filter first (if enabled)
-            if (temporal_filter_enabled_) {
-                pcl_cloud = apply_temporal_filter(pcl_cloud);
-            }
-
-            // Apply radius outlier filter after temporal (if enabled)
-            if (radius_outlier_enabled_) {
-                pcl::PointCloud<pcl::PointXYZI>::Ptr filtered_cloud(new pcl::PointCloud<pcl::PointXYZI>);
-                pcl::RadiusOutlierRemoval<pcl::PointXYZI> radius_outlier_removal;
-                
-                radius_outlier_removal.setInputCloud(pcl_cloud);
-                radius_outlier_removal.setRadiusSearch(radius_outlier_radius_);
-                radius_outlier_removal.setMinNeighborsInRadius(radius_outlier_min_neighbors_);
-                radius_outlier_removal.filter(*filtered_cloud);
-                
-                pcl_cloud = filtered_cloud;
-            }
-
-            // Convert back to ROS2 message once
-            sensor_msgs::msg::PointCloud2 output_cloud;
-            pcl::toROSMsg(*pcl_cloud, output_cloud);
-            output_cloud.header = combined_cloud.header;
-
-            // Publish filtered combined point cloud
-            combined_pointcloud_publisher_->publish(output_cloud);
-
-            // Convert to laser scan and publish only if there are subscribers
-            if (laserscan_publisher_->get_subscription_count() > 0) {
-                auto laser_scan = pointcloud_to_laserscan(pcl_cloud, output_cloud.header);
-                laserscan_publisher_->publish(laser_scan);
-            }
-
-            if (diag_verbose_) {
-                RCLCPP_DEBUG(this->get_logger(), "Published combined point cloud with %zu points and laser scan",
-                           pcl_cloud->points.size());
-            }
-        } else {
-            // No filtering, publish as-is
-            combined_pointcloud_publisher_->publish(combined_cloud);
-
-            // Convert to PCL for laser scan generation only if there are subscribers
-            if (laserscan_publisher_->get_subscription_count() > 0 && combined_cloud.width > 0) {
-                pcl::PointCloud<pcl::PointXYZI>::Ptr temp_cloud(new pcl::PointCloud<pcl::PointXYZI>);
-                pcl::fromROSMsg(combined_cloud, *temp_cloud);
-                auto laser_scan = pointcloud_to_laserscan(temp_cloud, combined_cloud.header);
-                laserscan_publisher_->publish(laser_scan);
-            }
-
-            if (diag_verbose_) {
-                RCLCPP_DEBUG(this->get_logger(), "Published combined point cloud with %zu points and laser scan",
-                           (size_t)combined_cloud.width);
-            }
+            auto laser_scan = pointcloud_to_laserscan(pcl_cloud, combined_cloud.header);
+            laserscan_publisher_->publish(laser_scan);
         }
+
     }
 
     pcl::PointCloud<pcl::PointXYZI>::Ptr RangeSensorMultiZone::apply_temporal_filter(const pcl::PointCloud<pcl::PointXYZI>::Ptr& input_cloud)
@@ -619,11 +664,6 @@ namespace range_sensor_multi_zone
         averaged_cloud->width = averaged_cloud->points.size();
         averaged_cloud->height = 1;
         averaged_cloud->is_dense = true;
-
-        if (diag_verbose_) {
-            RCLCPP_DEBUG(this->get_logger(), "Temporal filter (alpha=%.2f): %zu frames, %zu -> %zu points",
-                       temporal_filter_alpha_, pointcloud_buffer_.size(), input_cloud->points.size(), averaged_cloud->points.size());
-        }
 
         return averaged_cloud;
     }
@@ -774,10 +814,38 @@ namespace range_sensor_multi_zone
             stat.summary(diagnostic_msgs::msg::DiagnosticStatus::OK, "All sensors operational");
         }
 
-        // Add sensor read counts
+        // Calculate consolidated timing statistics
+        int64_t max_read_time = 0, max_convert_time = 0, max_tf_time = 0;
+        int64_t total_read_time = 0, total_convert_time = 0, total_tf_time = 0;
+        for (int i = 0; i < num_sensors_; i++) {
+            if (sensor_read_times_ms_[i] > max_read_time) max_read_time = sensor_read_times_ms_[i];
+            if (sensor_convert_times_ms_[i] > max_convert_time) max_convert_time = sensor_convert_times_ms_[i];
+            if (sensor_tf_times_ms_[i] > max_tf_time) max_tf_time = sensor_tf_times_ms_[i];
+            total_read_time += sensor_read_times_ms_[i];
+            total_convert_time += sensor_convert_times_ms_[i];
+            total_tf_time += sensor_tf_times_ms_[i];
+        }
+
+        // Add sensor read counts and data range info
         for (int i = 0; i < num_sensors_; i++) {
             std::string sensor_key = "Sensor " + std::to_string(i) + " reads";
             stat.add(sensor_key, static_cast<int>(sensor_read_counts_[i]));
+            std::string sensor_min_z_key = "Sensor " + std::to_string(i) + " min z (m)";
+            stat.add(sensor_min_z_key, sensor_min_z_[i]);
+            std::string sensor_max_z_key = "Sensor " + std::to_string(i) + " max z (m)";
+            stat.add(sensor_max_z_key, sensor_max_z_[i]);
+            std::string sensor_min_x_key = "Sensor " + std::to_string(i) + " min x (m)";
+            stat.add(sensor_min_x_key, sensor_min_x_[i]);
+            std::string sensor_max_x_key = "Sensor " + std::to_string(i) + " max x (m)";
+            stat.add(sensor_max_x_key, sensor_max_x_[i]);
+            std::string sensor_min_y_key = "Sensor " + std::to_string(i) + " min y (m)";
+            stat.add(sensor_min_y_key, sensor_min_y_[i]);
+            std::string sensor_max_y_key = "Sensor " + std::to_string(i) + " max y (m)";
+            stat.add(sensor_max_y_key, sensor_max_y_[i]);
+            std::string sensor_min_sigma_key = "Sensor " + std::to_string(i) + " min sigma (mm)";
+            stat.add(sensor_min_sigma_key, static_cast<int>(sensor_min_sigma_mm_[i]));
+            std::string sensor_max_sigma_key = "Sensor " + std::to_string(i) + " max sigma (mm)";
+            stat.add(sensor_max_sigma_key, static_cast<int>(sensor_max_sigma_mm_[i]));
         }
 
         // Add sensor configuration info
@@ -789,8 +857,26 @@ namespace range_sensor_multi_zone
         stat.add("Max Distance", std::to_string(max_distance_) + " mm");
         stat.add("Min Height", std::to_string(min_height_) + " m");
         stat.add("Max Height", std::to_string(max_height_) + " m");
+        stat.add("Target Status Filter", static_cast<int>(target_status_filter_));
+        stat.add("Range Sigma Threshold (mm)", range_sigma_threshold_);
         stat.add("Radius Outlier Filter", radius_outlier_enabled_ ? "Enabled" : "Disabled");
         stat.add("Temporal Filter", temporal_filter_enabled_ ? "Enabled" : "Disabled");
+
+        // Add consolidated timing info
+        stat.add("Timer callback total (ms)", static_cast<int>(timer_callback_time_ms_));
+        stat.add("Sensor I2C read max (ms)", static_cast<int>(max_read_time));
+        stat.add("Sensor I2C read total (ms)", static_cast<int>(total_read_time));
+        stat.add("Point cloud conversion max (ms)", static_cast<int>(max_convert_time));
+        stat.add("Point cloud conversion total (ms)", static_cast<int>(total_convert_time));
+        stat.add("TF transform max (ms)", static_cast<int>(max_tf_time));
+        stat.add("TF transform total (ms)", static_cast<int>(total_tf_time));
+        stat.add("Combine & transform time (ms)", static_cast<int>(combine_transform_time_ms_));
+        if (temporal_filter_enabled_) {
+            stat.add("Temporal filter time (ms)", static_cast<int>(temporal_filter_time_ms_));
+        }
+        if (radius_outlier_enabled_) {
+            stat.add("Radius filter time (ms)", static_cast<int>(radius_filter_time_ms_));
+        }
     }
 
 }
