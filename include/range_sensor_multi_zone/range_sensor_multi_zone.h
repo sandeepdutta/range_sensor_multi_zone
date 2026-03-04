@@ -22,6 +22,8 @@
 #include <range_sensor_multi_zone/vl53l5cx_plugin_motion_indicator.h>
 #include <range_sensor_multi_zone/vl53l5cx_plugin_xtalk.h>
 #include <mutex>
+#include <map>
+#include <deque>
 
 namespace range_sensor_multi_zone
 {
@@ -45,28 +47,23 @@ namespace range_sensor_multi_zone
             bool radius_outlier_enabled_;
             double radius_outlier_radius_;
             int radius_outlier_min_neighbors_;
-            bool temporal_filter_enabled_;
-            int temporal_filter_size_;
-            double temporal_filter_alpha_;
             uint8_t sensor_mask_;
             double horizontal_fov_;
             double vertical_fov_;
             int sharpener_percent_;
-            int range_sigma_threshold_;
+            float range_sigma_percent_threshold_;
             uint8_t target_status_filter_;
             std::vector<std::string> frame_ids_;
             std::vector<std::string> topic_names_;
             std::vector<std::string> frame_ids_topic_names_;
             VL53L5CX_Configuration configuration_;
             rclcpp::TimerBase::SharedPtr timer_;
-            rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr combined_pointcloud_publisher_;
             rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr laserscan_publisher_;
             std::vector<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr> pointcloud_publishers_;
             rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
             std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
             std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
             std::vector<sensor_msgs::msg::PointCloud2> sensor_pointclouds_;
-            std::vector<pcl::PointCloud<pcl::PointXYZI>::Ptr> pointcloud_buffer_;
             std::mutex odom_mutex_;
             builtin_interfaces::msg::Time latest_odom_stamp_;
 
@@ -82,6 +79,10 @@ namespace range_sensor_multi_zone
                                sensor_max_y_, sensor_min_z_, sensor_max_z_;
             // Per sensor range sigma min/max
             std::vector<uint16_t> sensor_min_sigma_mm_, sensor_max_sigma_mm_;
+            // Per sensor raw distance min/max (mm)
+            std::vector<uint16_t> sensor_min_distance_mm_, sensor_max_distance_mm_;
+            // Per sensor sigma as percentage of distance (%)
+            std::vector<float> sensor_min_sigma_percent_, sensor_max_sigma_percent_;
             std::vector<rclcpp::Time> last_sensor_read_change_times_;
             rclcpp::Time last_diagnostic_check_time_;
 
@@ -89,9 +90,7 @@ namespace range_sensor_multi_zone
             std::vector<int64_t> sensor_read_times_ms_;     // Per-sensor I2C read time
             std::vector<int64_t> sensor_convert_times_ms_;  // Per-sensor conversion time
             std::vector<int64_t> sensor_tf_times_ms_;       // Per-sensor TF transform time
-            int64_t combine_transform_time_ms_;             // Total combine and transform time
             int64_t timer_callback_time_ms_;                // Total timer callback time
-            int64_t temporal_filter_time_ms_;               // Temporal filter time
             int64_t radius_filter_time_ms_;                 // Radius outlier filter time
 
             /**
@@ -130,29 +129,6 @@ namespace range_sensor_multi_zone
              * @param timestamp Header timestamp for point cloud (from odometry or clock)
              */
             void convert_to_pointcloud(int sensor_id, const VL53L5CX_ResultsData& results, const rclcpp::Time& timestamp);
-
-            /**
-             * @brief Combine individual sensor point clouds and generate laser scan
-             *
-             * Concatenates already-transformed and filtered individual point clouds.
-             * Generates 2D laser scan projection from combined 3D point cloud.
-             * Publishes combined point cloud and laser scan to topics.
-             * Uses latest odometry timestamp if available.
-             *
-             * @param timestamp Callback timestamp to use as fallback if no odometry available
-             */
-            void combine_and_transform_pointclouds(const rclcpp::Time& timestamp);
-
-            /**
-             * @brief Apply temporal exponential moving average filter
-             *
-             * Maintains buffer of N recent frames and applies weighted averaging
-             * across frames using alpha parameter. Uses voxel-based grouping.
-             *
-             * @param input_cloud Current point cloud to add to buffer
-             * @return Filtered point cloud with temporal smoothing applied
-             */
-            pcl::PointCloud<pcl::PointXYZI>::Ptr apply_temporal_filter(const pcl::PointCloud<pcl::PointXYZI>::Ptr& input_cloud);
 
             /**
              * @brief Convert 3D point cloud to 2D laser scan message

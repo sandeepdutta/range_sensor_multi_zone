@@ -21,9 +21,6 @@ def generate_launch_description():
                                      'radius_outlier_enabled': True,
                                      'radius_outlier_radius': 0.1,
                                      'radius_outlier_min_neighbors': 3,
-                                     'temporal_filter_enabled': True,
-                                     'temporal_filter_alpha': 0.7, # new reading 70% 
-                                     'temporal_filter_size': 2,
                                      'sensor_mask': 0x00, # 0x00 = all sensors enabled, 0xaa corner sensors enabled
                                      'horizontal_fov':45.0,  # degrees
                                      'vertical_fov': 45.0, # degrees

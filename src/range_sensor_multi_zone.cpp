@@ -30,14 +30,11 @@ namespace range_sensor_multi_zone
         radius_outlier_enabled_ = this->declare_parameter("radius_outlier_enabled", true);
         radius_outlier_radius_ = this->declare_parameter("radius_outlier_radius", 0.1);
         radius_outlier_min_neighbors_ = this->declare_parameter("radius_outlier_min_neighbors", 3);
-        temporal_filter_enabled_ = this->declare_parameter("temporal_filter_enabled", false);
-        temporal_filter_size_ = this->declare_parameter("temporal_filter_size", 3);
-        temporal_filter_alpha_ = this->declare_parameter("temporal_filter_alpha", 0.3);
         sensor_mask_ = this->declare_parameter("sensor_mask", 0); // 0 = all sensors enabled
         horizontal_fov_ = this->declare_parameter("horizontal_fov", 53.0); // degrees
         vertical_fov_ = this->declare_parameter("vertical_fov", 45.0); // degrees
         sharpener_percent_ = this->declare_parameter("sharpener_percent", 14); // default value from sensor
-        range_sigma_threshold_ = this->declare_parameter("range_sigma_threshold", 20); // mm
+        range_sigma_percent_threshold_ = this->declare_parameter("range_sigma_percent_threshold", 10.0); // % of distance
         target_status_filter_ = this->declare_parameter("target_status_filter", 5); // 5=valid only, 2+=accept merged targets, 0+=accept all
         ranging_frequency_hz_ = this->declare_parameter("ranging_frequency_hz", 10);
         timer_period_ = 1000 / ranging_frequency_hz_; // in milliseconds
@@ -50,15 +47,12 @@ namespace range_sensor_multi_zone
         RCLCPP_INFO(this->get_logger(), "Radius outlier filter enabled: %s", radius_outlier_enabled_ ? "true" : "false");
         RCLCPP_INFO(this->get_logger(), "Radius outlier radius: %f m", radius_outlier_radius_);
         RCLCPP_INFO(this->get_logger(), "Radius outlier min neighbors: %d", radius_outlier_min_neighbors_);
-        RCLCPP_INFO(this->get_logger(), "Temporal filter enabled: %s", temporal_filter_enabled_ ? "true" : "false");
-        RCLCPP_INFO(this->get_logger(), "Temporal filter size: %d frames", temporal_filter_size_);
-        RCLCPP_INFO(this->get_logger(), "Temporal filter alpha: %f", temporal_filter_alpha_);
         RCLCPP_INFO(this->get_logger(), "Sensor mask: 0x%02X", sensor_mask_);
         RCLCPP_INFO(this->get_logger(), "Horizontal FOV: %f degrees", horizontal_fov_);
         RCLCPP_INFO(this->get_logger(), "Vertical FOV: %f degrees", vertical_fov_);
         RCLCPP_INFO(this->get_logger(), "Resolution: %dx%d", resolution_, resolution_);
         RCLCPP_INFO(this->get_logger(), "Sharpener percent: %d%%", sharpener_percent_);
-        RCLCPP_INFO(this->get_logger(), "Range sigma threshold: %d mm", range_sigma_threshold_);
+        RCLCPP_INFO(this->get_logger(), "Range sigma threshold: %.1f%% of distance", range_sigma_percent_threshold_);
         RCLCPP_INFO(this->get_logger(), "Target status filter: %d (5=valid only, 2+=merged targets OK, 0+=accept all)", target_status_filter_);
         frame_ids_topic_names_ = this->declare_parameter("frame_ids", std::vector<std::string>{"Sensor_0", 
                                                                                                "Sensor_1", 
@@ -70,9 +64,6 @@ namespace range_sensor_multi_zone
                                                                                                "Sensor_7"});
         timer_ = this->create_wall_timer(std::chrono::milliseconds(timer_period_),
                                 std::bind(&RangeSensorMultiZone::timer_callback, this));
-
-        // Initialize combined point cloud publisher
-        combined_pointcloud_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("range_pointcloud", 10);
 
         // Initialize laser scan publisher
         laserscan_publisher_ = this->create_publisher<sensor_msgs::msg::LaserScan>("range_scan", 10);
@@ -108,6 +99,12 @@ namespace range_sensor_multi_zone
         // Initialize range sigma tracking
         sensor_min_sigma_mm_.resize(num_sensors_, std::numeric_limits<uint16_t>::max());
         sensor_max_sigma_mm_.resize(num_sensors_, 0);
+        // Initialize raw distance tracking
+        sensor_min_distance_mm_.resize(num_sensors_, std::numeric_limits<uint16_t>::max());
+        sensor_max_distance_mm_.resize(num_sensors_, 0);
+        // Initialize sigma percentage tracking
+        sensor_min_sigma_percent_.resize(num_sensors_, 100.0f);  // Start at 100%
+        sensor_max_sigma_percent_.resize(num_sensors_, 0.0f);
         last_sensor_read_change_times_.resize(num_sensors_, this->now());
         last_diagnostic_check_time_ = this->now();
 
@@ -115,9 +112,7 @@ namespace range_sensor_multi_zone
         sensor_read_times_ms_.resize(num_sensors_, 0);
         sensor_convert_times_ms_.resize(num_sensors_, 0);
         sensor_tf_times_ms_.resize(num_sensors_, 0);
-        combine_transform_time_ms_ = 0;
         timer_callback_time_ms_ = 0;
-        temporal_filter_time_ms_ = 0;
         radius_filter_time_ms_ = 0;
 
         // Initialize diagnostic updater
@@ -263,9 +258,6 @@ namespace range_sensor_multi_zone
     {
             auto timer_start = std::chrono::high_resolution_clock::now();
 
-            // Capture timestamp at the start of callback for synchronized publishing
-            rclcpp::Time callback_timestamp = this->get_clock()->now();
-
             // Loop over the sensors
             for (int i = 0; i < num_sensors_; i++) {
                 auto read_start = std::chrono::high_resolution_clock::now();
@@ -287,7 +279,7 @@ namespace range_sensor_multi_zone
                     sensor_read_times_ms_[i] = 0;  // Reset if not ready
                     continue;
                 }
-
+                
                 // Get the data
                 VL53L5CX_ResultsData results;
                 if (vl53l5cx_get_ranging_data(&configuration_, &results) != 0) {
@@ -302,6 +294,8 @@ namespace range_sensor_multi_zone
                 // Increment sensor read count for diagnostics
                 sensor_read_counts_[i]++;
 
+                // Capture timestamp  
+                rclcpp::Time callback_timestamp = this->get_clock()->now();
                 // Get the latest odometry timestamp at time of reading
                 rclcpp::Time sensor_odom_timestamp;
                 {
@@ -319,12 +313,6 @@ namespace range_sensor_multi_zone
                 } 
             }
 
-            // Combine all sensor point clouds and transform to base_link
-            auto combine_start = std::chrono::high_resolution_clock::now();
-            combine_and_transform_pointclouds(callback_timestamp);
-            auto combine_end = std::chrono::high_resolution_clock::now();
-            combine_transform_time_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(combine_end - combine_start).count();
-
             // Update diagnostics if verbose mode is enabled
             if (diag_verbose_ && diagnostic_updater_) {
                 diagnostic_updater_->force_update();
@@ -339,37 +327,8 @@ namespace range_sensor_multi_zone
     {
         auto convert_start = std::chrono::high_resolution_clock::now();
 
-        // Create ROS2 point cloud for this sensor
-        sensor_pointclouds_[sensor_id].data.clear();
-        sensor_pointclouds_[sensor_id].header.stamp = timestamp;
-        sensor_pointclouds_[sensor_id].header.frame_id = frame_ids_topic_names_[sensor_id];
-        sensor_pointclouds_[sensor_id].height = 1;
-        sensor_pointclouds_[sensor_id].is_dense = true;
-
-        // Set point cloud fields
-        sensor_pointclouds_[sensor_id].fields.resize(4);
-        sensor_pointclouds_[sensor_id].fields[0].name = "x";
-        sensor_pointclouds_[sensor_id].fields[0].offset = 0;
-        sensor_pointclouds_[sensor_id].fields[0].datatype = sensor_msgs::msg::PointField::FLOAT32;
-        sensor_pointclouds_[sensor_id].fields[0].count = 1;
-        
-        sensor_pointclouds_[sensor_id].fields[1].name = "y";
-        sensor_pointclouds_[sensor_id].fields[1].offset = 4;
-        sensor_pointclouds_[sensor_id].fields[1].datatype = sensor_msgs::msg::PointField::FLOAT32;
-        sensor_pointclouds_[sensor_id].fields[1].count = 1;
-        
-        sensor_pointclouds_[sensor_id].fields[2].name = "z";
-        sensor_pointclouds_[sensor_id].fields[2].offset = 8;
-        sensor_pointclouds_[sensor_id].fields[2].datatype = sensor_msgs::msg::PointField::FLOAT32;
-        sensor_pointclouds_[sensor_id].fields[2].count = 1;
-        
-        sensor_pointclouds_[sensor_id].fields[3].name = "intensity";
-        sensor_pointclouds_[sensor_id].fields[3].offset = 12;
-        sensor_pointclouds_[sensor_id].fields[3].datatype = sensor_msgs::msg::PointField::FLOAT32;
-        sensor_pointclouds_[sensor_id].fields[3].count = 1;
-        
-        sensor_pointclouds_[sensor_id].point_step = 16; // 4 fields * 4 bytes each
-        sensor_pointclouds_[sensor_id].row_step = 0;
+        // Create PCL point cloud for processing
+        pcl::PointCloud<pcl::PointXYZI>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZI>);
 
         // VL53L5CX field of view and zone layout
         // Use configurable field of view parameters
@@ -385,6 +344,10 @@ namespace range_sensor_multi_zone
         sensor_min_y_[sensor_id] = std::numeric_limits<uint32_t>::max();
         sensor_max_sigma_mm_[sensor_id] = 0;
         sensor_min_sigma_mm_[sensor_id] = std::numeric_limits<uint16_t>::max();
+        sensor_max_distance_mm_[sensor_id] = 0;
+        sensor_min_distance_mm_[sensor_id] = std::numeric_limits<uint16_t>::max();
+        sensor_min_sigma_percent_[sensor_id] = 100.0f;
+        sensor_max_sigma_percent_[sensor_id] = 0.0f;
         int min_distance_mm = 10000;
 
         for (int zone_id = 0; zone_id < zones; zone_id++) {
@@ -413,22 +376,20 @@ namespace range_sensor_multi_zone
                 uint16_t distance_mm = results.distance_mm[target_idx];
                 uint8_t target_status = results.target_status[target_idx];
                 uint16_t range_sigma_mm = results.range_sigma_mm[target_idx];
+
                 // Skip invalid measurements
                 if (distance_mm <= min_distance_ ||
                     distance_mm > max_distance_ ||
-                    range_sigma_mm > range_sigma_threshold_ ||
                     target_status < target_status_filter_) continue;
 
-                // Track range sigma min/max
-                if (range_sigma_mm < sensor_min_sigma_mm_[sensor_id]) sensor_min_sigma_mm_[sensor_id] = range_sigma_mm;
-                if (range_sigma_mm > sensor_max_sigma_mm_[sensor_id]) sensor_max_sigma_mm_[sensor_id] = range_sigma_mm;
-
-                if (distance_mm < min_distance_mm) min_distance_mm = distance_mm;
+                // Skip if range sigma exceeds percentage threshold
+                float sigma_percent = (range_sigma_mm * 100.0f) / distance_mm;
+                if (sigma_percent > range_sigma_percent_threshold_) continue;
                 
                 // Convert distance from mm to meters
                 float distance_m = distance_mm / 1000.0f;
 
-                // Match Python implementation:
+                // Project the point from sensor coordinates to Cartesian coordinates:
                 // x = e*cos(w*per_px - deg2rad(fov)/2 - deg2rad(90))
                 // y = e*sin(h*per_px - deg2rad(fov)/2)
                 // z = e
@@ -453,51 +414,52 @@ namespace range_sensor_multi_zone
                     continue; // Skip this point
                 }
 
-                // Add point to ROS2 point cloud
-                sensor_pointclouds_[sensor_id].data.resize(sensor_pointclouds_[sensor_id].data.size() + 16);
-                uint8_t* data_ptr = &sensor_pointclouds_[sensor_id].data[sensor_pointclouds_[sensor_id].data.size() - 16];
-                
-                memcpy(data_ptr, &x, 4);
-                memcpy(data_ptr + 4, &y, 4);
-                memcpy(data_ptr + 8, &z, 4);
-                
-                // Use range sigma as intensity
-                float intensity = static_cast<float>(range_sigma_mm);
-                memcpy(data_ptr + 12, &intensity, 4);
+                // Track range sigma min/max
+                if (range_sigma_mm < sensor_min_sigma_mm_[sensor_id]) sensor_min_sigma_mm_[sensor_id] = range_sigma_mm;
+                if (range_sigma_mm > sensor_max_sigma_mm_[sensor_id]) sensor_max_sigma_mm_[sensor_id] = range_sigma_mm;
+
+                // Track distance min/max
+                if (distance_mm < sensor_min_distance_mm_[sensor_id]) sensor_min_distance_mm_[sensor_id] = distance_mm;
+                if (distance_mm > sensor_max_distance_mm_[sensor_id]) sensor_max_distance_mm_[sensor_id] = distance_mm;
+
+                // track sigma as percentage of distance
+                if (sigma_percent < sensor_min_sigma_percent_[sensor_id]) sensor_min_sigma_percent_[sensor_id] = sigma_percent;
+                if (sigma_percent > sensor_max_sigma_percent_[sensor_id]) sensor_max_sigma_percent_[sensor_id] = sigma_percent;
+
+                if (distance_mm < min_distance_mm) min_distance_mm = distance_mm;
+
+                // Add point to PCL point cloud
+                pcl::PointXYZI point;
+                point.x = x;
+                point.y = y;
+                point.z = z;
+                point.intensity = static_cast<float>(range_sigma_mm);
+                pcl_cloud->points.push_back(point);
             }
         }
 
-        // Update point cloud properties
-        sensor_pointclouds_[sensor_id].width = sensor_pointclouds_[sensor_id].data.size() / 16; // 16 bytes per point
+        // Set PCL cloud properties
+        pcl_cloud->width = pcl_cloud->points.size();
+        pcl_cloud->height = 1;
+        pcl_cloud->is_dense = true;
 
         // Apply filtering to individual sensor point cloud
-        if (sensor_pointclouds_[sensor_id].width > 0 && (radius_outlier_enabled_ || temporal_filter_enabled_)) {
-            pcl::PointCloud<pcl::PointXYZI>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZI>);
-            pcl::fromROSMsg(sensor_pointclouds_[sensor_id], *pcl_cloud);
+        if (pcl_cloud->points.size() > 0 && radius_outlier_enabled_) {
+            pcl::PointCloud<pcl::PointXYZI>::Ptr filtered_cloud(new pcl::PointCloud<pcl::PointXYZI>);
+            pcl::RadiusOutlierRemoval<pcl::PointXYZI> radius_outlier_removal;
 
-            // Apply temporal moving average filter first (if enabled)
-            if (temporal_filter_enabled_) {
-                pcl_cloud = apply_temporal_filter(pcl_cloud);
-            }
+            radius_outlier_removal.setInputCloud(pcl_cloud);
+            radius_outlier_removal.setRadiusSearch(radius_outlier_radius_);
+            radius_outlier_removal.setMinNeighborsInRadius(radius_outlier_min_neighbors_);
+            radius_outlier_removal.filter(*filtered_cloud);
 
-            // Apply radius outlier filter (if enabled)
-            if (radius_outlier_enabled_) {
-                pcl::PointCloud<pcl::PointXYZI>::Ptr filtered_cloud(new pcl::PointCloud<pcl::PointXYZI>);
-                pcl::RadiusOutlierRemoval<pcl::PointXYZI> radius_outlier_removal;
-
-                radius_outlier_removal.setInputCloud(pcl_cloud);
-                radius_outlier_removal.setRadiusSearch(radius_outlier_radius_);
-                radius_outlier_removal.setMinNeighborsInRadius(radius_outlier_min_neighbors_);
-                radius_outlier_removal.filter(*filtered_cloud);
-
-                pcl_cloud = filtered_cloud;
-            }
-
-            // Convert back to ROS2 message
-            pcl::toROSMsg(*pcl_cloud, sensor_pointclouds_[sensor_id]);
-            sensor_pointclouds_[sensor_id].header.stamp = timestamp;
-            sensor_pointclouds_[sensor_id].header.frame_id = frame_ids_topic_names_[sensor_id];
+            pcl_cloud = filtered_cloud;
         }
+
+        // Convert PCL cloud to ROS2 message
+        pcl::toROSMsg(*pcl_cloud, sensor_pointclouds_[sensor_id]);
+        sensor_pointclouds_[sensor_id].header.stamp = timestamp;
+        sensor_pointclouds_[sensor_id].header.frame_id = frame_ids_topic_names_[sensor_id];
 
         // Transform point cloud to base_link before publishing
         sensor_msgs::msg::PointCloud2 transformed_cloud;
@@ -505,13 +467,13 @@ namespace range_sensor_multi_zone
             tf2::doTransform(sensor_pointclouds_[sensor_id], transformed_cloud,
                            tf_buffer_->lookupTransform("base_link", frame_ids_topic_names_[sensor_id], tf2::TimePointZero));
 
+            // Preserve the timestamp from the original cloud
+            transformed_cloud.header.stamp = sensor_pointclouds_[sensor_id].header.stamp;
+
             // Publish transformed individual point cloud only if there are subscribers
             if (pointcloud_publishers_[sensor_id]->get_subscription_count() > 0) {
                 pointcloud_publishers_[sensor_id]->publish(transformed_cloud);
             }
-
-            // Store transformed cloud for combine operation
-            sensor_pointclouds_[sensor_id] = transformed_cloud;
         } catch (tf2::TransformException &ex) {
             RCLCPP_WARN(this->get_logger(), "Could not transform point cloud from %s to base_link: %s",
                        frame_ids_topic_names_[sensor_id].c_str(), ex.what());
@@ -524,148 +486,6 @@ namespace range_sensor_multi_zone
     void RangeSensorMultiZone::publish_data()
     {
         RCLCPP_INFO(this->get_logger(), "RangeSensorMultiZone publish_data");
-    }
-
-    void RangeSensorMultiZone::combine_and_transform_pointclouds(const rclcpp::Time& timestamp)
-    {
-        // Create combined point cloud
-        sensor_msgs::msg::PointCloud2 combined_cloud;
-
-        // Use odometry timestamp if available, otherwise use callback timestamp
-        {
-            std::lock_guard<std::mutex> lock(odom_mutex_);
-            if (latest_odom_stamp_.sec != 0 || latest_odom_stamp_.nanosec != 0) {
-                combined_cloud.header.stamp = latest_odom_stamp_;
-            } else {
-                combined_cloud.header.stamp = timestamp;
-            }
-        }
-
-        combined_cloud.header.frame_id = "base_link";
-        combined_cloud.height = 1;
-        combined_cloud.is_dense = true;
-
-        // Set point cloud fields
-        combined_cloud.fields.resize(4);
-        combined_cloud.fields[0].name = "x";
-        combined_cloud.fields[0].offset = 0;
-        combined_cloud.fields[0].datatype = sensor_msgs::msg::PointField::FLOAT32;
-        combined_cloud.fields[0].count = 1;
-        
-        combined_cloud.fields[1].name = "y";
-        combined_cloud.fields[1].offset = 4;
-        combined_cloud.fields[1].datatype = sensor_msgs::msg::PointField::FLOAT32;
-        combined_cloud.fields[1].count = 1;
-        
-        combined_cloud.fields[2].name = "z";
-        combined_cloud.fields[2].offset = 8;
-        combined_cloud.fields[2].datatype = sensor_msgs::msg::PointField::FLOAT32;
-        combined_cloud.fields[2].count = 1;
-        
-        combined_cloud.fields[3].name = "intensity";
-        combined_cloud.fields[3].offset = 12;
-        combined_cloud.fields[3].datatype = sensor_msgs::msg::PointField::FLOAT32;
-        combined_cloud.fields[3].count = 1;
-        
-        combined_cloud.point_step = 16; // 4 fields * 4 bytes each
-        combined_cloud.row_step = 0;
-
-        // Combine all sensor point clouds (already transformed to base_link in convert_to_pointcloud)
-        for (int i = 0; i < num_sensors_; i++) {
-            // Skip sensor if masked out or no data
-            if (!is_sensor_enabled(i) || sensor_pointclouds_[i].data.empty()) continue;
-
-            // Concatenate already-transformed point clouds
-            combined_cloud.data.insert(combined_cloud.data.end(),
-                                     sensor_pointclouds_[i].data.begin(),
-                                     sensor_pointclouds_[i].data.end());
-        }
-
-        // Update combined point cloud properties
-        combined_cloud.width = combined_cloud.data.size() / 16; // 16 bytes per point
-
-        // Publish combined point cloud (already filtered at individual sensor level)
-        combined_pointcloud_publisher_->publish(combined_cloud);
-
-        // Convert to PCL for laser scan generation only if there are subscribers
-        if (laserscan_publisher_->get_subscription_count() > 0 && combined_cloud.width > 0) {
-            pcl::PointCloud<pcl::PointXYZI>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZI>);
-            pcl::fromROSMsg(combined_cloud, *pcl_cloud);
-            auto laser_scan = pointcloud_to_laserscan(pcl_cloud, combined_cloud.header);
-            laserscan_publisher_->publish(laser_scan);
-        }
-
-    }
-
-    pcl::PointCloud<pcl::PointXYZI>::Ptr RangeSensorMultiZone::apply_temporal_filter(const pcl::PointCloud<pcl::PointXYZI>::Ptr& input_cloud)
-    {
-        // Add current cloud to buffer
-        pointcloud_buffer_.push_back(input_cloud);
-
-        // Keep only the last N frames
-        if (pointcloud_buffer_.size() > static_cast<size_t>(temporal_filter_size_)) {
-            pointcloud_buffer_.erase(pointcloud_buffer_.begin());
-        }
-
-        // If buffer is not full yet, just return the current cloud
-        if (pointcloud_buffer_.size() < static_cast<size_t>(temporal_filter_size_)) {
-            return input_cloud;
-        }
-
-        // Create exponentially averaged point cloud
-        pcl::PointCloud<pcl::PointXYZI>::Ptr averaged_cloud(new pcl::PointCloud<pcl::PointXYZI>);
-
-        // Use exponential moving average with alpha parameter
-        // For each voxel, apply: new_value = alpha * current_value + (1-alpha) * previous_value
-        std::map<std::tuple<int, int, int>, pcl::PointXYZI> voxel_map;
-
-        // Voxelize points from all frames (10mm voxels for grouping)
-        float voxel_size = 0.01f; // 10mm
-        
-        // Process frames in chronological order (oldest first)
-        for (size_t frame_idx = 0; frame_idx < pointcloud_buffer_.size(); frame_idx++) {
-            const auto& cloud = pointcloud_buffer_[frame_idx];
-            float frame_weight = (frame_idx == pointcloud_buffer_.size() - 1) ? temporal_filter_alpha_ : (1.0f - temporal_filter_alpha_);
-            
-            for (const auto& point : cloud->points) {
-                int vx = static_cast<int>(point.x / voxel_size);
-                int vy = static_cast<int>(point.y / voxel_size);
-                int vz = static_cast<int>(point.z / voxel_size);
-                auto voxel_key = std::make_tuple(vx, vy, vz);
-                
-                if (voxel_map.find(voxel_key) == voxel_map.end()) {
-                    // First occurrence of this voxel
-                    voxel_map[voxel_key] = point;
-                } else {
-                    // Apply exponential moving average
-                    auto& existing_point = voxel_map[voxel_key];
-                    if (frame_idx == pointcloud_buffer_.size() - 1) {
-                        // Current frame: exponential moving average
-                        existing_point.x = temporal_filter_alpha_ * point.x + (1.0f - temporal_filter_alpha_) * existing_point.x;
-                        existing_point.y = temporal_filter_alpha_ * point.y + (1.0f - temporal_filter_alpha_) * existing_point.y;
-                        existing_point.z = temporal_filter_alpha_ * point.z + (1.0f - temporal_filter_alpha_) * existing_point.z;
-                        existing_point.intensity = temporal_filter_alpha_ * point.intensity + (1.0f - temporal_filter_alpha_) * existing_point.intensity;
-                    } else {
-                        // Previous frames: weighted average
-                        existing_point.x = frame_weight * point.x + (1.0f - frame_weight) * existing_point.x;
-                        existing_point.y = frame_weight * point.y + (1.0f - frame_weight) * existing_point.y;
-                        existing_point.z = frame_weight * point.z + (1.0f - frame_weight) * existing_point.z;
-                        existing_point.intensity = frame_weight * point.intensity + (1.0f - frame_weight) * existing_point.intensity;
-                    }
-                }
-            }
-        }
-
-        // Convert map to point cloud
-        for (const auto& voxel : voxel_map) {
-            averaged_cloud->points.push_back(voxel.second);
-        }
-
-        averaged_cloud->width = averaged_cloud->points.size();
-        averaged_cloud->height = 1;
-        averaged_cloud->is_dense = true;
-
-        return averaged_cloud;
     }
 
     sensor_msgs::msg::LaserScan RangeSensorMultiZone::pointcloud_to_laserscan(const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud, const std_msgs::msg::Header& header)
@@ -842,25 +662,22 @@ namespace range_sensor_multi_zone
             stat.add(sensor_min_y_key, sensor_min_y_[i]);
             std::string sensor_max_y_key = "Sensor " + std::to_string(i) + " max y (m)";
             stat.add(sensor_max_y_key, sensor_max_y_[i]);
+            std::string sensor_min_distance_key = "Sensor " + std::to_string(i) + " min distance (mm)";
+            stat.add(sensor_min_distance_key, static_cast<int>(sensor_min_distance_mm_[i]));
+            std::string sensor_max_distance_key = "Sensor " + std::to_string(i) + " max distance (mm)";
+            stat.add(sensor_max_distance_key, static_cast<int>(sensor_max_distance_mm_[i]));
             std::string sensor_min_sigma_key = "Sensor " + std::to_string(i) + " min sigma (mm)";
             stat.add(sensor_min_sigma_key, static_cast<int>(sensor_min_sigma_mm_[i]));
             std::string sensor_max_sigma_key = "Sensor " + std::to_string(i) + " max sigma (mm)";
             stat.add(sensor_max_sigma_key, static_cast<int>(sensor_max_sigma_mm_[i]));
+            std::string sensor_min_sigma_percent_key = "Sensor " + std::to_string(i) + " min sigma (%)";
+            stat.add(sensor_min_sigma_percent_key, sensor_min_sigma_percent_[i]);
+            std::string sensor_max_sigma_percent_key = "Sensor " + std::to_string(i) + " max sigma (%)";
+            stat.add(sensor_max_sigma_percent_key, sensor_max_sigma_percent_[i]);
         }
 
-        // Add sensor configuration info
-        stat.add("Number of Sensors", num_sensors_);
-        stat.add("Sensor Mask", static_cast<int>(sensor_mask_));
-        stat.add("Resolution", std::to_string(resolution_) + "x" + std::to_string(resolution_));
-        stat.add("Ranging Frequency", std::to_string(ranging_frequency_hz_) + " Hz");
-        stat.add("Min Distance", std::to_string(min_distance_) + " mm");
-        stat.add("Max Distance", std::to_string(max_distance_) + " mm");
-        stat.add("Min Height", std::to_string(min_height_) + " m");
-        stat.add("Max Height", std::to_string(max_height_) + " m");
-        stat.add("Target Status Filter", static_cast<int>(target_status_filter_));
-        stat.add("Range Sigma Threshold (mm)", range_sigma_threshold_);
-        stat.add("Radius Outlier Filter", radius_outlier_enabled_ ? "Enabled" : "Disabled");
-        stat.add("Temporal Filter", temporal_filter_enabled_ ? "Enabled" : "Disabled");
+        // Add configuration info
+        stat.add("Range Sigma Threshold (%)", range_sigma_percent_threshold_);
 
         // Add consolidated timing info
         stat.add("Timer callback total (ms)", static_cast<int>(timer_callback_time_ms_));
@@ -870,10 +687,6 @@ namespace range_sensor_multi_zone
         stat.add("Point cloud conversion total (ms)", static_cast<int>(total_convert_time));
         stat.add("TF transform max (ms)", static_cast<int>(max_tf_time));
         stat.add("TF transform total (ms)", static_cast<int>(total_tf_time));
-        stat.add("Combine & transform time (ms)", static_cast<int>(combine_transform_time_ms_));
-        if (temporal_filter_enabled_) {
-            stat.add("Temporal filter time (ms)", static_cast<int>(temporal_filter_time_ms_));
-        }
         if (radius_outlier_enabled_) {
             stat.add("Radius filter time (ms)", static_cast<int>(radius_filter_time_ms_));
         }
