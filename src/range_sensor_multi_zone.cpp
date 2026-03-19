@@ -68,6 +68,9 @@ namespace range_sensor_multi_zone
         // Initialize laser scan publisher
         laserscan_publisher_ = this->create_publisher<sensor_msgs::msg::LaserScan>("range_scan", 10);
 
+        // Initialize combined point cloud publisher
+        combined_pointcloud_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("range_pointcloud", 10);
+
         // Initialize individual point cloud publishers
         pointcloud_publishers_.resize(num_sensors_);
         for (int i = 0; i < num_sensors_; i++) {
@@ -85,6 +88,9 @@ namespace range_sensor_multi_zone
 
         // Initialize ROS2 point cloud for each sensor
         sensor_pointclouds_.resize(num_sensors_);
+
+        // Initialize per-sensor odometry timestamps
+        sensor_odom_timestamps_.resize(num_sensors_);
 
         // Initialize sensor read tracking for diagnostics
         sensor_read_counts_.resize(num_sensors_, 0);
@@ -278,8 +284,7 @@ namespace range_sensor_multi_zone
                 if (!isReady) {
                     sensor_read_times_ms_[i] = 0;  // Reset if not ready
                     continue;
-                }
-                
+                }               
                 // Get the data
                 VL53L5CX_ResultsData results;
                 if (vl53l5cx_get_ranging_data(&configuration_, &results) != 0) {
@@ -287,14 +292,7 @@ namespace range_sensor_multi_zone
                     sensor_read_times_ms_[i] = 0;  // Reset on error
                     continue;
                 }
-
-                auto read_end = std::chrono::high_resolution_clock::now();
-                sensor_read_times_ms_[i] = std::chrono::duration_cast<std::chrono::milliseconds>(read_end - read_start).count();
-
-                // Increment sensor read count for diagnostics
-                sensor_read_counts_[i]++;
-
-                // Capture timestamp  
+                 // Capture timestamp
                 rclcpp::Time callback_timestamp = this->get_clock()->now();
                 // Get the latest odometry timestamp at time of reading
                 rclcpp::Time sensor_odom_timestamp;
@@ -306,11 +304,65 @@ namespace range_sensor_multi_zone
                         sensor_odom_timestamp = callback_timestamp;
                     }
                 }
+                auto read_end = std::chrono::high_resolution_clock::now();
+                sensor_read_times_ms_[i] = std::chrono::duration_cast<std::chrono::milliseconds>(read_end - read_start).count();
+
+                // Increment sensor read count for diagnostics
+                sensor_read_counts_[i]++;
+
+                // Store per-sensor odometry timestamp for later use in transforms
+                sensor_odom_timestamps_[i] = sensor_odom_timestamp;
 
                 // Only convert to point cloud if sensor is enabled
                 if (is_sensor_enabled(i)) {
                     convert_to_pointcloud(i, results, sensor_odom_timestamp);
                 } 
+            }
+
+            // Combine all sensor point clouds and publish
+            if (combined_pointcloud_publisher_->get_subscription_count() > 0) {
+                pcl::PointCloud<pcl::PointXYZI>::Ptr combined_pcl_cloud(new pcl::PointCloud<pcl::PointXYZI>);
+                rclcpp::Time last_added_timestamp;
+
+                // Combine all enabled sensor point clouds - transform from sensor frames to base_link
+                for (int i = 0; i < num_sensors_; i++) {
+                    if (!is_sensor_enabled(i) || sensor_pointclouds_[i].data.empty()) continue;
+
+                    // Check if transform from odom to sensor frame is available
+                    try {
+                        tf_buffer_->lookupTransform("odom", frame_ids_topic_names_[i], sensor_odom_timestamps_[i]);
+                    } catch (tf2::TransformException &ex) {
+                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Transform from odom to %s not available: %s",
+                                           frame_ids_topic_names_[i].c_str(), ex.what());
+                        continue;
+                    }
+
+                    // Transform from sensor frame to base_link using the sensor's odometry timestamp
+                    sensor_msgs::msg::PointCloud2 transformed_cloud;
+                    try {
+                        tf2::doTransform(sensor_pointclouds_[i], transformed_cloud,
+                                       tf_buffer_->lookupTransform("base_link", frame_ids_topic_names_[i], sensor_odom_timestamps_[i]));
+
+                        // Convert transformed cloud to PCL and add to combined cloud
+                        pcl::PointCloud<pcl::PointXYZI>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZI>);
+                        pcl::fromROSMsg(transformed_cloud, *pcl_cloud);
+                        *combined_pcl_cloud += *pcl_cloud;
+                        // Track the timestamp of the last sensor point cloud added
+                        last_added_timestamp = sensor_odom_timestamps_[i];
+                    } catch (tf2::TransformException &ex) {
+                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Could not transform sensor %d from %s to base_link: %s",
+                                           i, frame_ids_topic_names_[i].c_str(), ex.what());
+                    }
+                }
+
+                // Convert combined PCL cloud to ROS message and publish
+                if (combined_pcl_cloud->points.size() > 0) {
+                    sensor_msgs::msg::PointCloud2 combined_cloud_msg;
+                    pcl::toROSMsg(*combined_pcl_cloud, combined_cloud_msg);
+                    combined_cloud_msg.header.stamp = last_added_timestamp;
+                    combined_cloud_msg.header.frame_id = "base_link";
+                    combined_pointcloud_publisher_->publish(combined_cloud_msg);
+                }
             }
 
             // Update diagnostics if verbose mode is enabled
@@ -461,22 +513,9 @@ namespace range_sensor_multi_zone
         sensor_pointclouds_[sensor_id].header.stamp = timestamp;
         sensor_pointclouds_[sensor_id].header.frame_id = frame_ids_topic_names_[sensor_id];
 
-        // Transform point cloud to base_link before publishing
-        sensor_msgs::msg::PointCloud2 transformed_cloud;
-        try {
-            tf2::doTransform(sensor_pointclouds_[sensor_id], transformed_cloud,
-                           tf_buffer_->lookupTransform("base_link", frame_ids_topic_names_[sensor_id], tf2::TimePointZero));
-
-            // Preserve the timestamp from the original cloud
-            transformed_cloud.header.stamp = sensor_pointclouds_[sensor_id].header.stamp;
-
-            // Publish transformed individual point cloud only if there are subscribers
-            if (pointcloud_publishers_[sensor_id]->get_subscription_count() > 0) {
-                pointcloud_publishers_[sensor_id]->publish(transformed_cloud);
-            }
-        } catch (tf2::TransformException &ex) {
-            RCLCPP_WARN(this->get_logger(), "Could not transform point cloud from %s to base_link: %s",
-                       frame_ids_topic_names_[sensor_id].c_str(), ex.what());
+        // Publish individual point cloud in sensor frame
+        if (pointcloud_publishers_[sensor_id]->get_subscription_count() > 0) {
+            pointcloud_publishers_[sensor_id]->publish(sensor_pointclouds_[sensor_id]);
         }
 
         auto convert_end = std::chrono::high_resolution_clock::now();

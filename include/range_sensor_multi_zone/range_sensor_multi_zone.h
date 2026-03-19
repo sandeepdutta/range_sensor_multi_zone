@@ -58,6 +58,7 @@ namespace range_sensor_multi_zone
             std::vector<std::string> frame_ids_topic_names_;
             VL53L5CX_Configuration configuration_;
             rclcpp::TimerBase::SharedPtr timer_;
+            rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr combined_pointcloud_publisher_;
             rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr laserscan_publisher_;
             std::vector<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr> pointcloud_publishers_;
             rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
@@ -85,6 +86,7 @@ namespace range_sensor_multi_zone
             std::vector<float> sensor_min_sigma_percent_, sensor_max_sigma_percent_;
             std::vector<rclcpp::Time> last_sensor_read_change_times_;
             rclcpp::Time last_diagnostic_check_time_;
+            std::vector<rclcpp::Time> sensor_odom_timestamps_;  // Per-sensor odometry timestamps for transforms
 
             // Timing tracking for diagnostics
             std::vector<int64_t> sensor_read_times_ms_;     // Per-sensor I2C read time
