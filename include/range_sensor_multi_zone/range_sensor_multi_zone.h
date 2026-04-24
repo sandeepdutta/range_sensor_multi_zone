@@ -84,9 +84,12 @@ namespace range_sensor_multi_zone
             std::vector<uint16_t> sensor_min_distance_mm_, sensor_max_distance_mm_;
             // Per sensor sigma as percentage of distance (%)
             std::vector<float> sensor_min_sigma_percent_, sensor_max_sigma_percent_;
+            // Per sensor published point cloud point counts
+            std::vector<uint32_t> sensor_pointcloud_points_;
             std::vector<rclcpp::Time> last_sensor_read_change_times_;
             rclcpp::Time last_diagnostic_check_time_;
             std::vector<rclcpp::Time> sensor_odom_timestamps_;  // Per-sensor odometry timestamps for transforms
+            std::vector<rclcpp::Time> sensor_start_times_;      // Time start_ranging() completed per sensor
 
             // Timing tracking for diagnostics
             std::vector<int64_t> sensor_read_times_ms_;     // Per-sensor I2C read time

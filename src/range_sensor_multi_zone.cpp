@@ -84,6 +84,7 @@ RangeSensorMultiZone::RangeSensorMultiZone()
     sensor_pointclouds_.resize(num_sensors_);
     // Initialize per-sensor odometry timestamps
     sensor_odom_timestamps_.resize(num_sensors_);
+    sensor_start_times_.resize(num_sensors_);
     // Initialize sensor read tracking for diagnostics
     sensor_read_counts_.resize(num_sensors_, 0);
     last_sensor_read_counts_.resize(num_sensors_, 0);
@@ -103,6 +104,7 @@ RangeSensorMultiZone::RangeSensorMultiZone()
     // Initialize sigma percentage tracking
     sensor_min_sigma_percent_.resize(num_sensors_, 100.0f);  // Start at 100%
     sensor_max_sigma_percent_.resize(num_sensors_, 0.0f);
+    sensor_pointcloud_points_.resize(num_sensors_, 0);
     last_sensor_read_change_times_.resize(num_sensors_, this->now());
     last_diagnostic_check_time_ = this->now();
     // Initialize timing tracking
@@ -217,6 +219,7 @@ void RangeSensorMultiZone::init_sensor()
             rclcpp::shutdown();
             return;
         }
+        RCLCPP_INFO(this->get_logger(), "Sensor %d ranging frequency set to %d Hz", i, ranging_frequency_hz_);
         if (vl53l5cx_set_target_order(&configuration_, VL53L5CX_TARGET_ORDER_CLOSEST) != 0) {
             RCLCPP_ERROR(this->get_logger(), "Failed to set target order for sensor %d", i);
             rclcpp::shutdown();
@@ -229,13 +232,18 @@ void RangeSensorMultiZone::init_sensor()
             return;
         }
         RCLCPP_INFO(this->get_logger(), "Sensor %d sharpener percent set to %d%%", i, sharpener_percent_);
-        RCLCPP_INFO(this->get_logger(), "Sensor %d sharpener percent set to %d", i, 0);
-        RCLCPP_INFO(this->get_logger(), "Sensor %d ranging frequency set to %d Hz", i, ranging_frequency_hz_);
+        if (vl53l5cx_set_ranging_mode(&configuration_, VL53L5CX_RANGING_MODE_CONTINUOUS) != 0) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to set ranging mode for sensor %d", i);
+            rclcpp::shutdown();
+            return;
+        }
+        RCLCPP_INFO(this->get_logger(), "Sensor %d Ranging mode set to Continous", i);
         if (vl53l5cx_start_ranging(&configuration_) != 0) {
             RCLCPP_ERROR(this->get_logger(), "Failed to start ranging for sensor %d", i);
             rclcpp::shutdown();
             return;
         }
+        sensor_start_times_[i] = this->now();
         RCLCPP_INFO(this->get_logger(), "Sensor %d ranging started", i);
     }
     RCLCPP_INFO(this->get_logger(), "RangeSensorMultiZone init_sensor done");
@@ -290,8 +298,31 @@ void RangeSensorMultiZone::timer_callback()
         sensor_odom_timestamps_[i] = sensor_odom_timestamp;
         // Only convert to point cloud if sensor is enabled
         if (is_sensor_enabled(i)) {
-            convert_to_pointcloud(i, results, sensor_odom_timestamp);
-        } 
+            // Snap the measurement time to the nearest sample boundary based on elapsed wall time.
+            // Using round() rather than read count so that missed samples (due to system load)
+            // still produce the correct capture time instead of compressing the timeline.
+            double period = 1.0 / ranging_frequency_hz_;
+            double elapsed = (callback_timestamp - sensor_start_times_[i]).seconds();
+            int64_t sample_index = static_cast<int64_t>(std::round(elapsed / period));
+            rclcpp::Time sensor_time = sensor_start_times_[i] +
+                rclcpp::Duration::from_seconds(static_cast<double>(sample_index) * period);
+            // If the computed stamp is ahead of the latest available sensor->odom transform,
+            // clamp to that transform's time so downstream TF lookups succeed.
+            rclcpp::Time cloud_time = sensor_time;
+            try {
+                auto latest_tf = tf_buffer_->lookupTransform(
+                    "odom", frame_ids_topic_names_[i], tf2::TimePointZero);
+                rclcpp::Time latest_tf_time(latest_tf.header.stamp);
+                if (sensor_time > latest_tf_time) {
+                    cloud_time = latest_tf_time;
+                }
+            } catch (tf2::TransformException &) {
+                cloud_time = sensor_odom_timestamp;
+            }
+            // Keep odom timestamp in sync with the chosen cloud time for combined cloud TF lookups
+            sensor_odom_timestamps_[i] = cloud_time;
+            convert_to_pointcloud(i, results, cloud_time);
+        }
     }
     // Combine all sensor point clouds and publish
     if (combined_pointcloud_publisher_->get_subscription_count() > 0) {
@@ -454,6 +485,7 @@ void RangeSensorMultiZone::convert_to_pointcloud(int sensor_id, const VL53L5CX_R
         radius_outlier_removal.filter(*filtered_cloud);
         pcl_cloud = filtered_cloud;
     }
+    sensor_pointcloud_points_[sensor_id] = static_cast<uint32_t>(pcl_cloud->points.size());
     // Convert PCL cloud to ROS2 message
     pcl::toROSMsg(*pcl_cloud, sensor_pointclouds_[sensor_id]);
     sensor_pointclouds_[sensor_id].header.stamp = timestamp;
@@ -609,6 +641,8 @@ void RangeSensorMultiZone::diagnostic_callback(diagnostic_updater::DiagnosticSta
     for (int i = 0; i < num_sensors_; i++) {
         std::string sensor_key = "Sensor " + std::to_string(i) + " reads";
         stat.add(sensor_key, static_cast<int>(sensor_read_counts_[i]));
+        std::string sensor_pts_key = "Sensor " + std::to_string(i) + " pointcloud points";
+        stat.add(sensor_pts_key, static_cast<int>(sensor_pointcloud_points_[i]));
         std::string sensor_min_z_key = "Sensor " + std::to_string(i) + " min z (m)";
         stat.add(sensor_min_z_key, sensor_min_z_[i]);
         std::string sensor_max_z_key = "Sensor " + std::to_string(i) + " max z (m)";
@@ -622,9 +656,11 @@ void RangeSensorMultiZone::diagnostic_callback(diagnostic_updater::DiagnosticSta
         std::string sensor_max_y_key = "Sensor " + std::to_string(i) + " max y (m)";
         stat.add(sensor_max_y_key, sensor_max_y_[i]);
         std::string sensor_min_distance_key = "Sensor " + std::to_string(i) + " min distance (mm)";
-        stat.add(sensor_min_distance_key, static_cast<int>(sensor_min_distance_mm_[i]));
+        stat.add(sensor_min_distance_key, static_cast<int>(sensor_min_distance_mm_[i] == std::numeric_limits<uint16_t>::max() ? 
+                                                            0 : sensor_min_distance_mm_[i]));
         std::string sensor_max_distance_key = "Sensor " + std::to_string(i) + " max distance (mm)";
-        stat.add(sensor_max_distance_key, static_cast<int>(sensor_max_distance_mm_[i]));
+        stat.add(sensor_max_distance_key, static_cast<int>(sensor_max_distance_mm_[i] == std::numeric_limits<uint16_t>::max() ? 
+                                                            0 : sensor_max_distance_mm_[i]));
         std::string sensor_min_sigma_key = "Sensor " + std::to_string(i) + " min sigma (mm)";
         stat.add(sensor_min_sigma_key, static_cast<int>(sensor_min_sigma_mm_[i]));
         std::string sensor_max_sigma_key = "Sensor " + std::to_string(i) + " max sigma (mm)";
