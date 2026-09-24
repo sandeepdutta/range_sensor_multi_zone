@@ -10,7 +10,7 @@ def generate_launch_description():
                         output='screen',
                         #prefix = ['xterm -e gdb -ex run --args'],
                         remappings=[('odom', 'odometry/filtered_local')],
-                        parameters=[{'i2c_adapter_nr': 7,
+                        parameters=[{'i2c_adapter_nr': 1,
                                      'num_sensors': 8,
                                      'resolution': 8, # 8x8, 4 = 4x4
                                      'ranging_frequency_hz': 15,
