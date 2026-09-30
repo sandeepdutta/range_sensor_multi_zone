@@ -10,7 +10,7 @@ def generate_launch_description():
                         output='screen',
                         #prefix = ['xterm -e gdb -ex run --args'],
                         remappings=[('odom', 'odometry/filtered_local')],
-                        parameters=[{'i2c_adapter_nr': 1,
+                        parameters=[{'i2c_adapter_nr': 7,
                                      'num_sensors': 8,
                                      'resolution': 8, # 8x8, 4 = 4x4
                                      'ranging_frequency_hz': 15,
@@ -34,12 +34,12 @@ def generate_launch_description():
                                      'vertical_fov': 45.0, # degrees
                                      'sharpener_percent': 25, #
                                      'diag_verbose': False,
-                                     'frame_ids': ['BOT_LF_TOF', #0 bottom left front
-                                                   'BOT_FS_TOF', #1 bottom fron straight
-                                                   'BOT_RF_TOF', #2 bottom right front
-                                                   'BOT_RS_TOF', #3 bottom right straight
-                                                   'BOT_RB_TOF', #4 bottom right back
-                                                   'BOT_BS_TOF', #5 bottom back straight
-                                                   'BOT_LB_TOF', #6 bottom left back
-                                                   'BOT_LS_TOF']}] #7 bottom left straight
+                                     'frame_ids': ['TOP_LF_TOF', #0 bottom left front
+                                                   'TOP_FS_TOF', #1 bottom fron straight
+                                                   'TOP_RF_TOF', #2 bottom right front
+                                                   'TOP_RS_TOF', #3 bottom right straight
+                                                   'TOP_RB_TOF', #4 bottom right back
+                                                   'TOP_BS_TOF', #5 bottom back straight
+                                                   'TOP_LB_TOF', #6 bottom left back
+                                                   'TOP_LS_TOF']}] #7 bottom left straight
                                 )])
