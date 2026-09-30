@@ -9,6 +9,12 @@
 #include <cmath>
 #include <cerrno>
 #include <chrono>
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <limits>
+#include <nlohmann/json.hpp>
 #include <tf2/LinearMath/Transform.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include "range_sensor_multi_zone/range_sensor_multi_zone.h"
@@ -25,6 +31,10 @@ RangeSensorMultiZone::RangeSensorMultiZone()
     resolution_ = this->declare_parameter("resolution", 4);
     max_height_ = this->declare_parameter("max_height", 0.5);
     min_height_ = this->declare_parameter("min_height", 0.0);
+    calibration_enabled_ = this->declare_parameter("calibration_enabled", false);
+    calibration_file_ = this->declare_parameter("calibration_file", std::string(""));
+    calibration_samples_ = this->declare_parameter("calibration_samples", 20);
+    calibration_min_readings_ = this->declare_parameter("calibration_min_readings", 100);
     min_distance_ = this->declare_parameter("min_distance", 10);
     max_distance_ = this->declare_parameter("max_distance", 500);
     radius_outlier_enabled_ = this->declare_parameter("radius_outlier_enabled", true);
@@ -114,8 +124,20 @@ RangeSensorMultiZone::RangeSensorMultiZone()
     timer_callback_time_ms_ = 0;
     radius_filter_time_ms_ = 0;
     // Initialize diagnostic updater
+    // Initialize floor calibration, any spad without a calibration uses min_height
+    calibration_z_samples_.assign(num_sensors_, std::vector<std::vector<float>>(VL53L5CX_RESOLUTION_8X8));
+    calibration_reading_counts_.assign(num_sensors_, std::vector<uint32_t>(VL53L5CX_RESOLUTION_8X8, 0));
+    calibration_min_z_.assign(num_sensors_, std::vector<float>(VL53L5CX_RESOLUTION_8X8, std::numeric_limits<float>::quiet_NaN()));
+    load_calibration();
+    if (calibration_enabled_) {
+        calibration_sub_ = this->create_subscription<std_msgs::msg::Int32>(
+            "calibrate_tof", 10,
+            std::bind(&RangeSensorMultiZone::calibration_callback, this, std::placeholders::_1));
+        RCLCPP_INFO(this->get_logger(), "Calibration enabled on topic %s, file: %s, samples per spad: %d",
+                    calibration_sub_->get_topic_name(), calibration_file_.c_str(), calibration_samples_);
+    }
     diagnostic_updater_ = std::make_unique<diagnostic_updater::Updater>(this);
-    diagnostic_updater_->setHardwareID("Range Sensor Multi Zone");
+    diagnostic_updater_->setHardwareID(this->declare_parameter("hardware_id", std::string("Range Sensor Multi Zone")));
     diagnostic_updater_->add("Sensor Status", this, &RangeSensorMultiZone::diagnostic_callback);
     // Create timer to periodically update diagnostics (1 Hz) if not verbose
     if (!diag_verbose_) {
@@ -328,34 +350,17 @@ void RangeSensorMultiZone::timer_callback()
     if (combined_pointcloud_publisher_->get_subscription_count() > 0) {
         pcl::PointCloud<pcl::PointXYZI>::Ptr combined_pcl_cloud(new pcl::PointCloud<pcl::PointXYZI>);
         rclcpp::Time last_added_timestamp;
-        // Combine all enabled sensor point clouds - transform from sensor frames to base_link
+        // Combine all enabled sensor point clouds - already transformed to base_link
         for (int i = 0; i < num_sensors_; i++) {
             if (!is_sensor_enabled(i) ||
                 sensor_pointclouds_[i].data.empty() ||
                 sensor_pointclouds_[i].width * sensor_pointclouds_[i].height < 2) continue;
-            // Check if transform from odom to sensor frame is available
-            try {
-                tf_buffer_->lookupTransform("odom", frame_ids_topic_names_[i], sensor_odom_timestamps_[i]);
-            } catch (tf2::TransformException &ex) {
-                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Transform from odom to %s not available: %s",
-                                   frame_ids_topic_names_[i].c_str(), ex.what());
-                continue;
-            }
-            // Transform from sensor frame to base_link using the sensor's odometry timestamp
-            sensor_msgs::msg::PointCloud2 transformed_cloud;
-            try {
-                tf2::doTransform(sensor_pointclouds_[i], transformed_cloud,
-                               tf_buffer_->lookupTransform("base_link", frame_ids_topic_names_[i], sensor_odom_timestamps_[i]));
-                // Convert transformed cloud to PCL and add to combined cloud
-                pcl::PointCloud<pcl::PointXYZI>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZI>);
-                pcl::fromROSMsg(transformed_cloud, *pcl_cloud);
-                *combined_pcl_cloud += *pcl_cloud;
-                // Track the timestamp of the last sensor point cloud added
-                last_added_timestamp = sensor_odom_timestamps_[i];
-            } catch (tf2::TransformException &ex) {
-                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Could not transform sensor %d from %s to base_link: %s",
-                                   i, frame_ids_topic_names_[i].c_str(), ex.what());
-            }
+            // Convert to PCL and add to combined cloud
+            pcl::PointCloud<pcl::PointXYZI>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZI>);
+            pcl::fromROSMsg(sensor_pointclouds_[i], *pcl_cloud);
+            *combined_pcl_cloud += *pcl_cloud;
+            // Track the timestamp of the last sensor point cloud added
+            last_added_timestamp = sensor_pointclouds_[i].header.stamp;
         }
         // Convert combined PCL cloud to ROS message and publish
         if (combined_pcl_cloud->points.size() > 0) {
@@ -376,6 +381,28 @@ void RangeSensorMultiZone::timer_callback()
 
 void RangeSensorMultiZone::convert_to_pointcloud(int sensor_id, const VL53L5CX_ResultsData& results, const rclcpp::Time& timestamp)
 {
+    // Look up sensor frame to base_link transform, drop the cloud if the transform is not available
+    auto tf_start = std::chrono::high_resolution_clock::now();
+    sensor_pointclouds_[sensor_id] = sensor_msgs::msg::PointCloud2();
+    tf2::Transform sensor_to_base_link;
+    try {
+        // Check if transform from odom to sensor frame is available
+        tf_buffer_->lookupTransform("odom", frame_ids_topic_names_[sensor_id], timestamp);
+    } catch (tf2::TransformException &ex) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Transform from odom to %s not available: %s",
+                           frame_ids_topic_names_[sensor_id].c_str(), ex.what());
+        return;
+    }
+    try {
+        tf2::fromMsg(tf_buffer_->lookupTransform("base_link", frame_ids_topic_names_[sensor_id], timestamp).transform,
+                     sensor_to_base_link);
+    } catch (tf2::TransformException &ex) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Could not transform sensor %d from %s to base_link: %s",
+                           sensor_id, frame_ids_topic_names_[sensor_id].c_str(), ex.what());
+        return;
+    }
+    auto tf_end = std::chrono::high_resolution_clock::now();
+    sensor_tf_times_ms_[sensor_id] = std::chrono::duration_cast<std::chrono::milliseconds>(tf_end - tf_start).count();
     auto convert_start = std::chrono::high_resolution_clock::now();
     // Create PCL point cloud for processing
     pcl::PointCloud<pcl::PointXYZI>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZI>);
@@ -408,10 +435,10 @@ void RangeSensorMultiZone::convert_to_pointcloud(int sensor_id, const VL53L5CX_R
         float per_px_h = horizontal_fov_rad / resolution_;
         float per_px_v = vertical_fov_rad / resolution_;
         
-        // Python: w*per_px - deg2rad(fov)/2 - deg2rad(90)
-        float zone_h_angle = col * per_px_h - horizontal_fov_rad / 2.0f - M_PI / 2.0f;
-        // Python: h*per_px - deg2rad(fov)/2
-        float zone_v_angle = row * per_px_v - vertical_fov_rad / 2.0f;
+        // Angles point at the zone centre: (w + 0.5)*per_px - deg2rad(fov)/2 - deg2rad(90)
+        float zone_h_angle = (col + 0.5f) * per_px_h - horizontal_fov_rad / 2.0f - M_PI / 2.0f;
+        // (h + 0.5)*per_px - deg2rad(fov)/2
+        float zone_v_angle = (row + 0.5f) * per_px_v - vertical_fov_rad / 2.0f;
         // Process all targets in this zone
         for (int target = 0; target < nb_targets && target < (int)VL53L5CX_NB_TARGET_PER_ZONE; target++) {
             int target_idx = zone_id * VL53L5CX_NB_TARGET_PER_ZONE + target;
@@ -422,34 +449,49 @@ void RangeSensorMultiZone::convert_to_pointcloud(int sensor_id, const VL53L5CX_R
             if (distance_mm <= min_distance_ ||
                 distance_mm > max_distance_ ||
                 target_status < target_status_filter_) continue;
-            // Skip if range sigma exceeds percentage threshold
+            // Skip if range sigma exceeds percentage threshold, while calibrating keep it
+            // for the calibration samples so far spads get enough floor readings
             float sigma_percent = (range_sigma_mm * 100.0f) / distance_mm;
-            if (sigma_percent > range_sigma_percent_threshold_) continue;
+            bool sigma_ok = sigma_percent <= range_sigma_percent_threshold_;
+            if (!sigma_ok && !calibration_active_) continue;
             
             // Convert distance from mm to meters
             float distance_m = distance_mm / 1000.0f;
-            // Project the point from sensor coordinates to Cartesian coordinates:
-            // x = e*cos(w*per_px - deg2rad(fov)/2 - deg2rad(90))
-            // y = e*sin(h*per_px - deg2rad(fov)/2)
-            // z = e
-            float sensor_x = distance_m * std::cos(zone_h_angle);
-            float sensor_y = distance_m * std::sin(zone_v_angle);
-            float sensor_z = distance_m;
+            // The distance is the depth along the sensor axis (perpendicular, like a depth camera),
+            // so the point is distance_m forward and offset by tan(angle) through the zone centre.
+            // Mounting errors are absorbed by the per spad floor calibration.
+            // ROS coordinate system: X forward, Y left, Z up
+            // (zone_h_angle includes -90 deg: cos(zone_h_angle) = sin(column angle))
+            float tan_h = std::tan(zone_h_angle + M_PI / 2.0f);  // column angle, positive = right
+            float tan_v = std::tan(zone_v_angle);                // row angle, positive = down
+            float x = distance_m;            // Forward
+            float y = -distance_m * tan_h;   // Left
+            float z = -distance_m * tan_v;   // Up (negative because sensor rows go down)
             
-            // Convert to ROS coordinate system: X forward, Y left, Z up
-            float x = sensor_z;   // Forward
-            float y = -sensor_x;   // Left
-            float z = -sensor_y;  // Up (negative because sensor Y is down)
-            
+            // Transform point from sensor frame to base_link
+            tf2::Vector3 base_link_point = sensor_to_base_link * tf2::Vector3(x, y, z);
+            x = base_link_point.x();
+            y = base_link_point.y();
+            z = base_link_point.z();
+
+            // Collect the lowest z values per spad while calibrating (before the sigma filter)
+            if (calibration_active_) {
+                add_calibration_sample(sensor_id, zone_id, z);
+            }
+            if (!sigma_ok) continue;
+
             if (z > sensor_max_z_[sensor_id]) sensor_max_z_[sensor_id] = z;
             if (z < sensor_min_z_[sensor_id]) sensor_min_z_[sensor_id] = z;
             if (x > sensor_max_x_[sensor_id]) sensor_max_x_[sensor_id] = x;
             if (x < sensor_min_x_[sensor_id]) sensor_min_x_[sensor_id] = x;
             if (y > sensor_max_y_[sensor_id]) sensor_max_y_[sensor_id] = y;
             if (y < sensor_min_y_[sensor_id]) sensor_min_y_[sensor_id] = y;
-            
-            // Apply height filtering - clip points outside min_height and max_height
-            if (z < min_height_ || z > max_height_) {
+
+            // Apply height filtering in base_link - clip points below the spad calibration
+            // (or min_height if not calibrated) and above max_height
+            float spad_min_z = calibration_min_z_[sensor_id][zone_id] + min_height_;
+            if (std::isnan(spad_min_z)) spad_min_z = min_height_;
+            if (z < spad_min_z || z > max_height_) {
                 continue; // Skip this point
             }
             // Track range sigma min/max
@@ -486,16 +528,16 @@ void RangeSensorMultiZone::convert_to_pointcloud(int sensor_id, const VL53L5CX_R
         pcl_cloud = filtered_cloud;
     }
     sensor_pointcloud_points_[sensor_id] = static_cast<uint32_t>(pcl_cloud->points.size());
-    // Convert PCL cloud to ROS2 message
+    // Convert PCL cloud to ROS2 message in the base_link frame
     pcl::toROSMsg(*pcl_cloud, sensor_pointclouds_[sensor_id]);
     sensor_pointclouds_[sensor_id].header.stamp = timestamp;
-    sensor_pointclouds_[sensor_id].header.frame_id = frame_ids_topic_names_[sensor_id];
-    // Publish individual point cloud in sensor frame
+    sensor_pointclouds_[sensor_id].header.frame_id = "base_link";
+    auto convert_end = std::chrono::high_resolution_clock::now();
+    sensor_convert_times_ms_[sensor_id] = std::chrono::duration_cast<std::chrono::milliseconds>(convert_end - convert_start).count();
+    // Publish individual point cloud in base_link frame
     if (pointcloud_publishers_[sensor_id]->get_subscription_count() > 0) {
         pointcloud_publishers_[sensor_id]->publish(sensor_pointclouds_[sensor_id]);
     }
-    auto convert_end = std::chrono::high_resolution_clock::now();
-    sensor_convert_times_ms_[sensor_id] = std::chrono::duration_cast<std::chrono::milliseconds>(convert_end - convert_start).count();
 }
 void RangeSensorMultiZone::publish_data()
 {
@@ -563,6 +605,166 @@ void RangeSensorMultiZone::odom_callback(const nav_msgs::msg::Odometry::SharedPt
 {
     std::lock_guard<std::mutex> lock(odom_mutex_);
     latest_odom_stamp_ = msg->header.stamp;
+}
+void RangeSensorMultiZone::calibration_callback(const std_msgs::msg::Int32::SharedPtr msg)
+{
+    if (msg->data == 1 && !calibration_active_) {
+        // Start collecting, discard samples from a previous calibration
+        for (auto & sensor_samples : calibration_z_samples_) {
+            for (auto & spad_samples : sensor_samples) {
+                spad_samples.clear();
+            }
+        }
+        for (auto & sensor_counts : calibration_reading_counts_) {
+            std::fill(sensor_counts.begin(), sensor_counts.end(), 0);
+        }
+        calibration_active_ = true;
+        RCLCPP_INFO(this->get_logger(), "Calibration started, keeping the %d lowest z values per spad, "
+                    "spads with fewer than %d readings will use min_height", calibration_samples_, calibration_min_readings_);
+    } else if (msg->data == 0 && calibration_active_) {
+        calibration_active_ = false;
+        RCLCPP_INFO(this->get_logger(), "Calibration stopped, saving to %s", calibration_file_.c_str());
+        if (save_calibration()) {
+            load_calibration();
+        }
+    }
+}
+void RangeSensorMultiZone::add_calibration_sample(int sensor_id, int zone_id, float z)
+{
+    // Keep the lowest calibration_samples_ z values of all readings: max-heap with the
+    // highest kept value on top, replaced whenever a lower reading arrives
+    calibration_reading_counts_[sensor_id][zone_id]++;
+    auto & samples = calibration_z_samples_[sensor_id][zone_id];
+    if (static_cast<int>(samples.size()) < calibration_samples_) {
+        samples.push_back(z);
+        std::push_heap(samples.begin(), samples.end());
+    } else if (z < samples.front()) {
+        std::pop_heap(samples.begin(), samples.end());
+        samples.back() = z;
+        std::push_heap(samples.begin(), samples.end());
+    }
+}
+void RangeSensorMultiZone::load_calibration()
+{
+    for (auto & sensor_min_z : calibration_min_z_) {
+        std::fill(sensor_min_z.begin(), sensor_min_z.end(), std::numeric_limits<float>::quiet_NaN());
+    }
+    if (calibration_file_.empty()) {
+        return;
+    }
+    std::ifstream file(calibration_file_);
+    if (!file.is_open()) {
+        RCLCPP_WARN(this->get_logger(), "Calibration file %s not found, using min_height %.3f m",
+                    calibration_file_.c_str(), min_height_);
+        return;
+    }
+    // Format: { "resolution": 8, "<frame_id>": { "<spad>": min_z, ... }, ... }
+    int loaded = 0;
+    try {
+        nlohmann::json calibration = nlohmann::json::parse(file);
+        int file_resolution = calibration.value("resolution", 0);
+        if (file_resolution != resolution_) {
+            RCLCPP_WARN(this->get_logger(), "Calibration file %s is for resolution %dx%d, sensor resolution is %dx%d, "
+                        "ignoring calibration and using min_height %.3f m. Recalibrate to use it.",
+                        calibration_file_.c_str(), file_resolution, file_resolution, resolution_, resolution_, min_height_);
+            return;
+        }
+        for (int i = 0; i < num_sensors_; i++) {
+            if (!calibration.contains(frame_ids_topic_names_[i])) continue;
+            for (auto & [spad, min_z] : calibration[frame_ids_topic_names_[i]].items()) {
+                int zone_id = std::stoi(spad);
+                if (zone_id < 0 || zone_id >= VL53L5CX_RESOLUTION_8X8) continue;
+                calibration_min_z_[i][zone_id] = min_z.get<float>();
+                loaded++;
+            }
+        }
+    } catch (const std::exception & ex) {
+        RCLCPP_ERROR(this->get_logger(), "Failed to read calibration file %s: %s, using min_height %.3f m",
+                     calibration_file_.c_str(), ex.what(), min_height_);
+        for (auto & sensor_min_z : calibration_min_z_) {
+            std::fill(sensor_min_z.begin(), sensor_min_z.end(), std::numeric_limits<float>::quiet_NaN());
+        }
+        return;
+    }
+    RCLCPP_INFO(this->get_logger(), "Loaded %d spad calibrations from %s, other spads use min_height %.3f m",
+                loaded, calibration_file_.c_str(), min_height_);
+    // Print each sensor's calibration as a resolution x resolution grid of min z in mm (base_link),
+    // as seen looking out from the sensor: row 0 = top of the field of view, column 0 = left
+    for (int i = 0; i < num_sensors_; i++) {
+        if (std::all_of(calibration_min_z_[i].begin(), calibration_min_z_[i].end(),
+                        [](float min_z) { return std::isnan(min_z); })) {
+            RCLCPP_INFO(this->get_logger(), "Calibration %s: none, using min_height %.3f m",
+                        frame_ids_topic_names_[i].c_str(), min_height_);
+            continue;
+        }
+        std::ostringstream grid;
+        char cell[32];
+        grid << "Calibration " << frame_ids_topic_names_[i] << " min z (mm), '-' = min_height:";
+        grid << "\n        ";
+        for (int col = 0; col < resolution_; col++) {
+            snprintf(cell, sizeof(cell), "%7d", col);
+            grid << cell;
+        }
+        for (int row = 0; row < resolution_; row++) {
+            snprintf(cell, sizeof(cell), "\n  row %d ", row);
+            grid << cell;
+            for (int col = 0; col < resolution_; col++) {
+                float min_z = calibration_min_z_[i][row * resolution_ + col];
+                if (std::isnan(min_z)) {
+                    snprintf(cell, sizeof(cell), "%7s", "-");
+                } else {
+                    snprintf(cell, sizeof(cell), "%7.1f", min_z * 1000.0f);
+                }
+                grid << cell;
+            }
+        }
+        RCLCPP_INFO(this->get_logger(), "%s", grid.str().c_str());
+    }
+}
+bool RangeSensorMultiZone::save_calibration()
+{
+    if (calibration_file_.empty()) {
+        RCLCPP_ERROR(this->get_logger(), "calibration_file parameter not set, calibration not saved");
+        return false;
+    }
+    nlohmann::json calibration = nlohmann::json::object();
+    calibration["resolution"] = resolution_;
+    int saved = 0;
+    for (int i = 0; i < num_sensors_; i++) {
+        nlohmann::json sensor_calibration = nlohmann::json::object();
+        for (int zone_id = 0; zone_id < VL53L5CX_RESOLUTION_8X8; zone_id++) {
+            const auto & samples = calibration_z_samples_[i][zone_id];
+            uint32_t readings = calibration_reading_counts_[i][zone_id];
+            // Too few readings to trust the lowest values, leave it out so it uses min_height
+            if (static_cast<int>(readings) < calibration_min_readings_) {
+                RCLCPP_WARN(this->get_logger(), "Sensor %s spad %d: only %u readings (need %d), not calibrated",
+                            frame_ids_topic_names_[i].c_str(), zone_id, readings, calibration_min_readings_);
+                continue;
+            }
+            float sum = 0.0f;
+            for (float z : samples) sum += z;
+            sensor_calibration[std::to_string(zone_id)] = sum / samples.size();
+            saved++;
+        }
+        calibration[frame_ids_topic_names_[i]] = sensor_calibration;
+    }
+    try {
+        std::filesystem::path path(calibration_file_);
+        if (path.has_parent_path()) {
+            std::filesystem::create_directories(path.parent_path());
+        }
+        std::ofstream file(calibration_file_);
+        if (!file.is_open()) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to open calibration file %s for writing", calibration_file_.c_str());
+            return false;
+        }
+        file << calibration.dump(2) << std::endl;
+    } catch (const std::exception & ex) {
+        RCLCPP_ERROR(this->get_logger(), "Failed to write calibration file %s: %s", calibration_file_.c_str(), ex.what());
+        return false;
+    }
+    RCLCPP_INFO(this->get_logger(), "Saved %d spad calibrations to %s", saved, calibration_file_.c_str());
+    return true;
 }
 void RangeSensorMultiZone::diagnostic_callback(diagnostic_updater::DiagnosticStatusWrapper & stat)
 {
@@ -672,6 +874,14 @@ void RangeSensorMultiZone::diagnostic_callback(diagnostic_updater::DiagnosticSta
     }
     // Add configuration info
     stat.add("Range Sigma Threshold (%)", range_sigma_percent_threshold_);
+    int calibrated_spads = 0;
+    for (const auto & sensor_min_z : calibration_min_z_) {
+        for (float min_z : sensor_min_z) {
+            if (!std::isnan(min_z)) calibrated_spads++;
+        }
+    }
+    stat.add("Calibration active", calibration_active_);
+    stat.add("Calibrated spads", calibrated_spads);
     // Add consolidated timing info
     stat.add("Timer callback total (ms)", static_cast<int>(timer_callback_time_ms_));
     stat.add("Sensor I2C read max (ms)", static_cast<int>(max_read_time));

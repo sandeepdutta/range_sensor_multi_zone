@@ -6,6 +6,7 @@
 #include <sensor_msgs/msg/laser_scan.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <std_msgs/msg/int32.hpp>
 #include <diagnostic_updater/diagnostic_updater.hpp>
 #include <diagnostic_updater/publisher.hpp>
 #include <tf2_ros/transform_listener.h>
@@ -98,6 +99,17 @@ namespace range_sensor_multi_zone
             int64_t timer_callback_time_ms_;                // Total timer callback time
             int64_t radius_filter_time_ms_;                 // Radius outlier filter time
 
+            // Floor calibration: per sensor, per spad (zone) minimum z in base_link
+            bool calibration_enabled_;                      // Subscribe to the calibrate_tof topic
+            std::string calibration_file_;                  // JSON file with per sensor/spad min z
+            int calibration_samples_;                       // Number of lowest z values kept per spad
+            int calibration_min_readings_;                  // Spads with fewer readings are not calibrated
+            bool calibration_active_ = false;               // Currently collecting samples
+            std::vector<std::vector<std::vector<float>>> calibration_z_samples_;  // [sensor][spad] max-heap of the lowest z values
+            std::vector<std::vector<uint32_t>> calibration_reading_counts_;  // [sensor][spad] readings seen while calibrating
+            std::vector<std::vector<float>> calibration_min_z_;  // [sensor][spad] min z, NaN = not calibrated (use min_height)
+            rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr calibration_sub_;
+
             /**
              * @brief Initialize VL53L5CX sensors via I2C
              *
@@ -180,6 +192,35 @@ namespace range_sensor_multi_zone
              * @param stat Diagnostic status wrapper to add key-value pairs
              */
             void diagnostic_callback(diagnostic_updater::DiagnosticStatusWrapper & stat);
+
+            /**
+             * @brief Callback for the calibrate_tof topic
+             *
+             * 1 starts collecting the lowest calibration_samples z values (base_link) per spad of each sensor.
+             * 0 (after 1) averages them per spad, writes the calibration file and applies it.
+             *
+             * @param msg 1 = start calibration, 0 = stop and save
+             */
+            void calibration_callback(const std_msgs::msg::Int32::SharedPtr msg);
+
+            /**
+             * @brief While calibrating, count a z value (base_link) for a spad and keep it if among its lowest calibration_samples_
+             */
+            void add_calibration_sample(int sensor_id, int zone_id, float z);
+
+            /**
+             * @brief Load per sensor/spad minimum z from calibration_file_
+             *
+             * Spads not in the file (or no file, or a file for a different resolution) fall back to min_height.
+             */
+            void load_calibration();
+
+            /**
+             * @brief Average the collected samples and write them to calibration_file_
+             *
+             * @return true if the file was written
+             */
+            bool save_calibration();
     };
 }
 #endif

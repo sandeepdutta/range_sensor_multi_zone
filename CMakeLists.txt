@@ -21,6 +21,8 @@ find_package(tf2_geometry_msgs REQUIRED)
 find_package(PCL REQUIRED)
 find_package(pcl_ros REQUIRED)
 find_package(pcl_conversions REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(nlohmann_json REQUIRED)
 
 add_executable(range_sensor_multi_zone
     src/platform/linux_platform.cpp
@@ -46,7 +48,9 @@ ament_target_dependencies(
   "tf2_geometry_msgs"
   "pcl_ros"
   "pcl_conversions"
+  "std_msgs"
 )
+target_link_libraries(range_sensor_multi_zone nlohmann_json::nlohmann_json)
 
 install(TARGETS range_sensor_multi_zone
   DESTINATION lib/${PROJECT_NAME})
