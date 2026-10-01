@@ -11,6 +11,7 @@
 #include <diagnostic_updater/publisher.hpp>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
+#include <tf2/LinearMath/Transform.h>
 #include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -28,6 +29,15 @@
 
 namespace range_sensor_multi_zone
 {
+    // Calibration reading: point in the sensor frame (to re-transform with a tilt correction)
+    // ranked by its base_link z
+    struct CalibrationSample
+    {
+        float z;
+        tf2::Vector3 point;
+        bool operator<(const CalibrationSample & other) const { return z < other.z; }
+    };
+
     class RangeSensorMultiZone : public rclcpp::Node
     {
         public:
@@ -104,9 +114,14 @@ namespace range_sensor_multi_zone
             std::string calibration_file_;                  // JSON file with per sensor/spad min z
             int calibration_samples_;                       // Number of lowest z values kept per spad
             int calibration_min_readings_;                  // Spads with fewer readings are not calibrated
+            double calibration_tilt_tolerance_percent_;     // Allowed top/bottom row floor z difference, % of sensor height
+            double calibration_max_tilt_deg_;               // Largest tilt correction searched, +/- degrees
             bool calibration_active_ = false;               // Currently collecting samples
-            std::vector<std::vector<std::vector<float>>> calibration_z_samples_;  // [sensor][spad] max-heap of the lowest z values
+            std::vector<std::vector<std::vector<CalibrationSample>>> calibration_z_samples_;  // [sensor][spad] max-heap of the lowest z readings
             std::vector<std::vector<uint32_t>> calibration_reading_counts_;  // [sensor][spad] readings seen while calibrating
+            std::vector<tf2::Transform> calibration_sensor_transforms_;  // [sensor] URDF sensor to base_link seen while calibrating
+            std::vector<bool> calibration_sensor_transform_valid_;
+            std::vector<double> tilt_corrections_rad_;      // [sensor] tilt about the sensor y axis, positive = further down than the URDF
             std::vector<std::vector<float>> calibration_min_z_;  // [sensor][spad] min z, NaN = not calibrated (use min_height)
             rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr calibration_sub_;
 
@@ -204,9 +219,23 @@ namespace range_sensor_multi_zone
             void calibration_callback(const std_msgs::msg::Int32::SharedPtr msg);
 
             /**
-             * @brief While calibrating, count a z value (base_link) for a spad and keep it if among its lowest calibration_samples_
+             * @brief While calibrating, count a reading for a spad and keep it if its base_link z is among its lowest calibration_samples_
              */
-            void add_calibration_sample(int sensor_id, int zone_id, float z);
+            void add_calibration_sample(int sensor_id, int zone_id, float z, const tf2::Vector3 & point);
+
+            /**
+             * @brief Average base_link z of a spad's calibration samples with a tilt correction applied
+             */
+            double calibration_spad_z(int sensor_id, int zone_id, double tilt_rad) const;
+
+            /**
+             * @brief Find the tilt correction that makes the top and bottom rows see the floor at the same height
+             *
+             * @param sensor_id Sensor index
+             * @param valid_spads Spads with enough calibration readings
+             * @return Tilt correction in radians (0 if not enough data)
+             */
+            double compute_tilt_correction(int sensor_id, const std::vector<bool> & valid_spads) const;
 
             /**
              * @brief Load per sensor/spad minimum z from calibration_file_

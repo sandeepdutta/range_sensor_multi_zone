@@ -35,6 +35,8 @@ RangeSensorMultiZone::RangeSensorMultiZone()
     calibration_file_ = this->declare_parameter("calibration_file", std::string(""));
     calibration_samples_ = this->declare_parameter("calibration_samples", 20);
     calibration_min_readings_ = this->declare_parameter("calibration_min_readings", 100);
+    calibration_tilt_tolerance_percent_ = this->declare_parameter("calibration_tilt_tolerance_percent", 5.0);
+    calibration_max_tilt_deg_ = this->declare_parameter("calibration_max_tilt_deg", 10.0);
     min_distance_ = this->declare_parameter("min_distance", 10);
     max_distance_ = this->declare_parameter("max_distance", 500);
     radius_outlier_enabled_ = this->declare_parameter("radius_outlier_enabled", true);
@@ -125,7 +127,10 @@ RangeSensorMultiZone::RangeSensorMultiZone()
     radius_filter_time_ms_ = 0;
     // Initialize diagnostic updater
     // Initialize floor calibration, any spad without a calibration uses min_height
-    calibration_z_samples_.assign(num_sensors_, std::vector<std::vector<float>>(VL53L5CX_RESOLUTION_8X8));
+    calibration_z_samples_.assign(num_sensors_, std::vector<std::vector<CalibrationSample>>(VL53L5CX_RESOLUTION_8X8));
+    calibration_sensor_transforms_.assign(num_sensors_, tf2::Transform::getIdentity());
+    calibration_sensor_transform_valid_.assign(num_sensors_, false);
+    tilt_corrections_rad_.assign(num_sensors_, 0.0);
     calibration_reading_counts_.assign(num_sensors_, std::vector<uint32_t>(VL53L5CX_RESOLUTION_8X8, 0));
     calibration_min_z_.assign(num_sensors_, std::vector<float>(VL53L5CX_RESOLUTION_8X8, std::numeric_limits<float>::quiet_NaN()));
     load_calibration();
@@ -401,6 +406,14 @@ void RangeSensorMultiZone::convert_to_pointcloud(int sensor_id, const VL53L5CX_R
                            sensor_id, frame_ids_topic_names_[sensor_id].c_str(), ex.what());
         return;
     }
+    // Keep the URDF transform for the tilt calculation, then apply the calibrated tilt correction
+    // (rotation about the sensor's own y axis, positive = further down)
+    if (calibration_active_) {
+        calibration_sensor_transforms_[sensor_id] = sensor_to_base_link;
+        calibration_sensor_transform_valid_[sensor_id] = true;
+    }
+    sensor_to_base_link = sensor_to_base_link *
+        tf2::Transform(tf2::Quaternion(tf2::Vector3(0, 1, 0), tilt_corrections_rad_[sensor_id]));
     auto tf_end = std::chrono::high_resolution_clock::now();
     sensor_tf_times_ms_[sensor_id] = std::chrono::duration_cast<std::chrono::milliseconds>(tf_end - tf_start).count();
     auto convert_start = std::chrono::high_resolution_clock::now();
@@ -435,10 +448,10 @@ void RangeSensorMultiZone::convert_to_pointcloud(int sensor_id, const VL53L5CX_R
         float per_px_h = horizontal_fov_rad / resolution_;
         float per_px_v = vertical_fov_rad / resolution_;
         
-        // Angles point at the zone centre: (w + 0.5)*per_px - deg2rad(fov)/2 - deg2rad(90)
-        float zone_h_angle = (col + 0.5f) * per_px_h - horizontal_fov_rad / 2.0f - M_PI / 2.0f;
-        // (h + 0.5)*per_px - deg2rad(fov)/2
-        float zone_v_angle = (row + 0.5f) * per_px_v - vertical_fov_rad / 2.0f;
+        // Python: w*per_px - deg2rad(fov)/2 - deg2rad(90)
+        float zone_h_angle = col * per_px_h - horizontal_fov_rad / 2.0f - M_PI / 2.0f;
+        // Python: h*per_px - deg2rad(fov)/2
+        float zone_v_angle = row * per_px_v - vertical_fov_rad / 2.0f;
         // Process all targets in this zone
         for (int target = 0; target < nb_targets && target < (int)VL53L5CX_NB_TARGET_PER_ZONE; target++) {
             int target_idx = zone_id * VL53L5CX_NB_TARGET_PER_ZONE + target;
@@ -457,26 +470,29 @@ void RangeSensorMultiZone::convert_to_pointcloud(int sensor_id, const VL53L5CX_R
             
             // Convert distance from mm to meters
             float distance_m = distance_mm / 1000.0f;
-            // The distance is the depth along the sensor axis (perpendicular, like a depth camera),
-            // so the point is distance_m forward and offset by tan(angle) through the zone centre.
-            // Mounting errors are absorbed by the per spad floor calibration.
-            // ROS coordinate system: X forward, Y left, Z up
-            // (zone_h_angle includes -90 deg: cos(zone_h_angle) = sin(column angle))
-            float tan_h = std::tan(zone_h_angle + M_PI / 2.0f);  // column angle, positive = right
-            float tan_v = std::tan(zone_v_angle);                // row angle, positive = down
-            float x = distance_m;            // Forward
-            float y = -distance_m * tan_h;   // Left
-            float z = -distance_m * tan_v;   // Up (negative because sensor rows go down)
+            // Project the point from sensor coordinates to Cartesian coordinates:
+            // x = e*cos(w*per_px - deg2rad(fov)/2 - deg2rad(90))
+            // y = e*sin(h*per_px - deg2rad(fov)/2)
+            // z = e
+            float sensor_x = distance_m * std::cos(zone_h_angle);
+            float sensor_y = distance_m * std::sin(zone_v_angle);
+            float sensor_z = distance_m;
+            
+            // Convert to ROS coordinate system: X forward, Y left, Z up
+            float x = sensor_z;   // Forward
+            float y = -sensor_x;   // Left
+            float z = -sensor_y;  // Up (negative because sensor Y is down)
+            tf2::Vector3 sensor_point(x, y, z);
             
             // Transform point from sensor frame to base_link
-            tf2::Vector3 base_link_point = sensor_to_base_link * tf2::Vector3(x, y, z);
+            tf2::Vector3 base_link_point = sensor_to_base_link * sensor_point;
             x = base_link_point.x();
             y = base_link_point.y();
             z = base_link_point.z();
 
             // Collect the lowest z values per spad while calibrating (before the sigma filter)
             if (calibration_active_) {
-                add_calibration_sample(sensor_id, zone_id, z);
+                add_calibration_sample(sensor_id, zone_id, z, sensor_point);
             }
             if (!sigma_ok) continue;
 
@@ -618,6 +634,7 @@ void RangeSensorMultiZone::calibration_callback(const std_msgs::msg::Int32::Shar
         for (auto & sensor_counts : calibration_reading_counts_) {
             std::fill(sensor_counts.begin(), sensor_counts.end(), 0);
         }
+        std::fill(calibration_sensor_transform_valid_.begin(), calibration_sensor_transform_valid_.end(), false);
         calibration_active_ = true;
         RCLCPP_INFO(this->get_logger(), "Calibration started, keeping the %d lowest z values per spad, "
                     "spads with fewer than %d readings will use min_height", calibration_samples_, calibration_min_readings_);
@@ -629,26 +646,133 @@ void RangeSensorMultiZone::calibration_callback(const std_msgs::msg::Int32::Shar
         }
     }
 }
-void RangeSensorMultiZone::add_calibration_sample(int sensor_id, int zone_id, float z)
+void RangeSensorMultiZone::add_calibration_sample(int sensor_id, int zone_id, float z, const tf2::Vector3 & point)
 {
-    // Keep the lowest calibration_samples_ z values of all readings: max-heap with the
-    // highest kept value on top, replaced whenever a lower reading arrives
+    // Keep the lowest calibration_samples_ z readings of all readings: max-heap with the
+    // highest kept reading on top, replaced whenever a lower reading arrives
     calibration_reading_counts_[sensor_id][zone_id]++;
     auto & samples = calibration_z_samples_[sensor_id][zone_id];
     if (static_cast<int>(samples.size()) < calibration_samples_) {
-        samples.push_back(z);
+        samples.push_back({z, point});
         std::push_heap(samples.begin(), samples.end());
-    } else if (z < samples.front()) {
+    } else if (z < samples.front().z) {
         std::pop_heap(samples.begin(), samples.end());
-        samples.back() = z;
+        samples.back() = {z, point};
         std::push_heap(samples.begin(), samples.end());
     }
+}
+double RangeSensorMultiZone::calibration_spad_z(int sensor_id, int zone_id, double tilt_rad) const
+{
+    // Re-transform the sensor frame points with the URDF transform plus the tilt correction
+    tf2::Transform sensor_to_base_link = calibration_sensor_transforms_[sensor_id] *
+        tf2::Transform(tf2::Quaternion(tf2::Vector3(0, 1, 0), tilt_rad));
+    const auto & samples = calibration_z_samples_[sensor_id][zone_id];
+    double sum = 0.0;
+    for (const auto & sample : samples) {
+        sum += (sensor_to_base_link * sample.point).z();
+    }
+    return sum / samples.size();
+}
+double RangeSensorMultiZone::compute_tilt_correction(int sensor_id, const std::vector<bool> & valid_spads) const
+{
+    const std::string & frame = frame_ids_topic_names_[sensor_id];
+    if (!calibration_sensor_transform_valid_[sensor_id]) {
+        RCLCPP_WARN(this->get_logger(), "Sensor %s: no transform seen while calibrating, tilt correction 0", frame.c_str());
+        return 0.0;
+    }
+    // The top and bottom rows need enough calibrated spads to compare
+    const int top_row = 0;
+    const int bottom_row = resolution_ - 1;
+    auto valid_in_row = [&](int row) {
+        int count = 0;
+        for (int col = 0; col < resolution_; col++) {
+            if (valid_spads[row * resolution_ + col]) count++;
+        }
+        return count;
+    };
+    if (valid_in_row(top_row) < (resolution_ + 1) / 2 || valid_in_row(bottom_row) < (resolution_ + 1) / 2) {
+        RCLCPP_WARN(this->get_logger(), "Sensor %s: top or bottom row has fewer than %d calibrated spads, tilt correction 0",
+                    frame.c_str(), (resolution_ + 1) / 2);
+        return 0.0;
+    }
+    // Difference between the average floor z of the top and bottom rows for a tilt correction
+    auto row_difference = [&](double tilt_rad) {
+        double row_z[2] = {0.0, 0.0};
+        const int rows[2] = {top_row, bottom_row};
+        for (int r = 0; r < 2; r++) {
+            int count = 0;
+            for (int col = 0; col < resolution_; col++) {
+                int zone_id = rows[r] * resolution_ + col;
+                if (!valid_spads[zone_id]) continue;
+                row_z[r] += calibration_spad_z(sensor_id, zone_id, tilt_rad);
+                count++;
+            }
+            row_z[r] /= count;
+        }
+        return row_z[0] - row_z[1];
+    };
+    // Variation as a percentage of the sensor height above base_link
+    double sensor_height = std::abs(calibration_sensor_transforms_[sensor_id].getOrigin().z());
+    auto variation_percent = [&](double difference) {
+        return sensor_height > 0.0 ? std::abs(difference) * 100.0 / sensor_height : 0.0;
+    };
+    // Scan the tilt range for the smallest difference, then refine where the difference changes sign
+    const double max_tilt = calibration_max_tilt_deg_ * M_PI / 180.0;
+    const double step = 0.1 * M_PI / 180.0;
+    double best_tilt = 0.0;
+    double best_difference = row_difference(0.0);
+    const double initial_difference = best_difference;
+    double previous_tilt = -max_tilt;
+    double previous_difference = row_difference(previous_tilt);
+    for (double tilt = -max_tilt + step; tilt <= max_tilt + 1e-9; tilt += step) {
+        double difference = row_difference(tilt);
+        if (std::abs(difference) < std::abs(best_difference)) {
+            best_tilt = tilt;
+            best_difference = difference;
+        }
+        if ((previous_difference < 0.0) != (difference < 0.0)) {
+            // Bisection between the two scan points
+            double low = previous_tilt, high = tilt, low_difference = previous_difference;
+            for (int iteration = 0; iteration < 30; iteration++) {
+                double mid = 0.5 * (low + high);
+                double mid_difference = row_difference(mid);
+                if ((low_difference < 0.0) == (mid_difference < 0.0)) {
+                    low = mid;
+                    low_difference = mid_difference;
+                } else {
+                    high = mid;
+                }
+            }
+            double root = 0.5 * (low + high);
+            double root_difference = row_difference(root);
+            if (std::abs(root_difference) < std::abs(best_difference)) {
+                best_tilt = root;
+                best_difference = root_difference;
+            }
+        }
+        previous_tilt = tilt;
+        previous_difference = difference;
+    }
+    double variation = variation_percent(best_difference);
+    if (variation > calibration_tilt_tolerance_percent_) {
+        RCLCPP_WARN(this->get_logger(), "Sensor %s: tilt correction %+.2f deg leaves top/bottom row difference %.1f mm "
+                    "(%.1f%% of sensor height, tolerance %.1f%%), check the mounting",
+                    frame.c_str(), best_tilt * 180.0 / M_PI, best_difference * 1000.0, variation,
+                    calibration_tilt_tolerance_percent_);
+    } else {
+        RCLCPP_INFO(this->get_logger(), "Sensor %s: tilt correction %+.2f deg, top/bottom row difference %.1f mm (%.1f%%) "
+                    "-> %.1f mm (%.1f%%)",
+                    frame.c_str(), best_tilt * 180.0 / M_PI, initial_difference * 1000.0,
+                    variation_percent(initial_difference), best_difference * 1000.0, variation);
+    }
+    return best_tilt;
 }
 void RangeSensorMultiZone::load_calibration()
 {
     for (auto & sensor_min_z : calibration_min_z_) {
         std::fill(sensor_min_z.begin(), sensor_min_z.end(), std::numeric_limits<float>::quiet_NaN());
     }
+    std::fill(tilt_corrections_rad_.begin(), tilt_corrections_rad_.end(), 0.0);
     if (calibration_file_.empty()) {
         return;
     }
@@ -658,7 +782,8 @@ void RangeSensorMultiZone::load_calibration()
                     calibration_file_.c_str(), min_height_);
         return;
     }
-    // Format: { "resolution": 8, "<frame_id>": { "<spad>": min_z, ... }, ... }
+    // Format: { "resolution": 8, "tilt_correction_deg": { "<frame_id>": deg, ... },
+    //           "<frame_id>": { "<spad>": min_z, ... }, ... }
     int loaded = 0;
     try {
         nlohmann::json calibration = nlohmann::json::parse(file);
@@ -669,7 +794,11 @@ void RangeSensorMultiZone::load_calibration()
                         calibration_file_.c_str(), file_resolution, file_resolution, resolution_, resolution_, min_height_);
             return;
         }
+        nlohmann::json tilt_corrections = calibration.value("tilt_correction_deg", nlohmann::json::object());
         for (int i = 0; i < num_sensors_; i++) {
+            if (tilt_corrections.contains(frame_ids_topic_names_[i])) {
+                tilt_corrections_rad_[i] = tilt_corrections[frame_ids_topic_names_[i]].get<double>() * M_PI / 180.0;
+            }
             if (!calibration.contains(frame_ids_topic_names_[i])) continue;
             for (auto & [spad, min_z] : calibration[frame_ids_topic_names_[i]].items()) {
                 int zone_id = std::stoi(spad);
@@ -684,6 +813,7 @@ void RangeSensorMultiZone::load_calibration()
         for (auto & sensor_min_z : calibration_min_z_) {
             std::fill(sensor_min_z.begin(), sensor_min_z.end(), std::numeric_limits<float>::quiet_NaN());
         }
+        std::fill(tilt_corrections_rad_.begin(), tilt_corrections_rad_.end(), 0.0);
         return;
     }
     RCLCPP_INFO(this->get_logger(), "Loaded %d spad calibrations from %s, other spads use min_height %.3f m",
@@ -693,13 +823,15 @@ void RangeSensorMultiZone::load_calibration()
     for (int i = 0; i < num_sensors_; i++) {
         if (std::all_of(calibration_min_z_[i].begin(), calibration_min_z_[i].end(),
                         [](float min_z) { return std::isnan(min_z); })) {
-            RCLCPP_INFO(this->get_logger(), "Calibration %s: none, using min_height %.3f m",
-                        frame_ids_topic_names_[i].c_str(), min_height_);
+            RCLCPP_INFO(this->get_logger(), "Calibration %s: tilt correction %+.2f deg, no spads, using min_height %.3f m",
+                        frame_ids_topic_names_[i].c_str(), tilt_corrections_rad_[i] * 180.0 / M_PI, min_height_);
             continue;
         }
         std::ostringstream grid;
         char cell[32];
-        grid << "Calibration " << frame_ids_topic_names_[i] << " min z (mm), '-' = min_height:";
+        snprintf(cell, sizeof(cell), "%+.2f", tilt_corrections_rad_[i] * 180.0 / M_PI);
+        grid << "Calibration " << frame_ids_topic_names_[i] << " tilt correction " << cell
+             << " deg, min z (mm), '-' = min_height:";
         grid << "\n        ";
         for (int col = 0; col < resolution_; col++) {
             snprintf(cell, sizeof(cell), "%7d", col);
@@ -729,21 +861,28 @@ bool RangeSensorMultiZone::save_calibration()
     }
     nlohmann::json calibration = nlohmann::json::object();
     calibration["resolution"] = resolution_;
+    calibration["tilt_correction_deg"] = nlohmann::json::object();
     int saved = 0;
     for (int i = 0; i < num_sensors_; i++) {
-        nlohmann::json sensor_calibration = nlohmann::json::object();
-        for (int zone_id = 0; zone_id < VL53L5CX_RESOLUTION_8X8; zone_id++) {
-            const auto & samples = calibration_z_samples_[i][zone_id];
+        // Too few readings to trust the lowest values, leave it out so it uses min_height
+        std::vector<bool> valid_spads(VL53L5CX_RESOLUTION_8X8, false);
+        for (int zone_id = 0; zone_id < resolution_ * resolution_; zone_id++) {
             uint32_t readings = calibration_reading_counts_[i][zone_id];
-            // Too few readings to trust the lowest values, leave it out so it uses min_height
-            if (static_cast<int>(readings) < calibration_min_readings_) {
+            if (static_cast<int>(readings) < calibration_min_readings_ ||
+                calibration_z_samples_[i][zone_id].empty()) {
                 RCLCPP_WARN(this->get_logger(), "Sensor %s spad %d: only %u readings (need %d), not calibrated",
                             frame_ids_topic_names_[i].c_str(), zone_id, readings, calibration_min_readings_);
                 continue;
             }
-            float sum = 0.0f;
-            for (float z : samples) sum += z;
-            sensor_calibration[std::to_string(zone_id)] = sum / samples.size();
+            valid_spads[zone_id] = true;
+        }
+        // Tilt correction that levels the top and bottom rows, then the spad floor z with it applied
+        double tilt = compute_tilt_correction(i, valid_spads);
+        calibration["tilt_correction_deg"][frame_ids_topic_names_[i]] = tilt * 180.0 / M_PI;
+        nlohmann::json sensor_calibration = nlohmann::json::object();
+        for (int zone_id = 0; zone_id < resolution_ * resolution_; zone_id++) {
+            if (!valid_spads[zone_id] || !calibration_sensor_transform_valid_[i]) continue;
+            sensor_calibration[std::to_string(zone_id)] = calibration_spad_z(i, zone_id, tilt);
             saved++;
         }
         calibration[frame_ids_topic_names_[i]] = sensor_calibration;
@@ -882,6 +1021,9 @@ void RangeSensorMultiZone::diagnostic_callback(diagnostic_updater::DiagnosticSta
     }
     stat.add("Calibration active", calibration_active_);
     stat.add("Calibrated spads", calibrated_spads);
+    for (int i = 0; i < num_sensors_; i++) {
+        stat.add("Sensor " + std::to_string(i) + " tilt correction (deg)", tilt_corrections_rad_[i] * 180.0 / M_PI);
+    }
     // Add consolidated timing info
     stat.add("Timer callback total (ms)", static_cast<int>(timer_callback_time_ms_));
     stat.add("Sensor I2C read max (ms)", static_cast<int>(max_read_time));
