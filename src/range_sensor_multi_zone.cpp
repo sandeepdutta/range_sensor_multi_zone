@@ -42,6 +42,9 @@ RangeSensorMultiZone::RangeSensorMultiZone()
     radius_outlier_enabled_ = this->declare_parameter("radius_outlier_enabled", true);
     radius_outlier_radius_ = this->declare_parameter("radius_outlier_radius", 0.1);
     radius_outlier_min_neighbors_ = this->declare_parameter("radius_outlier_min_neighbors", 3);
+    // A sensor contributes to the combined cloud only with at least this many
+    // points; fewer is usually a stray return rather than an obstacle.
+    min_points_to_combine_ = this->declare_parameter("min_points_to_combine", 4);
     sensor_mask_ = this->declare_parameter("sensor_mask", 0); // 0 = all sensors enabled
     horizontal_fov_ = this->declare_parameter("horizontal_fov", 53.0); // degrees
     vertical_fov_ = this->declare_parameter("vertical_fov", 45.0); // degrees
@@ -359,7 +362,8 @@ void RangeSensorMultiZone::timer_callback()
         for (int i = 0; i < num_sensors_; i++) {
             if (!is_sensor_enabled(i) ||
                 sensor_pointclouds_[i].data.empty() ||
-                sensor_pointclouds_[i].width * sensor_pointclouds_[i].height < 2) continue;
+                static_cast<int>(sensor_pointclouds_[i].width * sensor_pointclouds_[i].height) <
+                    min_points_to_combine_) continue;
             // Convert to PCL and add to combined cloud
             pcl::PointCloud<pcl::PointXYZI>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZI>);
             pcl::fromROSMsg(sensor_pointclouds_[i], *pcl_cloud);

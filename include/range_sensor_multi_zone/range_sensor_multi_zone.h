@@ -58,6 +58,7 @@ namespace range_sensor_multi_zone
             bool radius_outlier_enabled_;
             double radius_outlier_radius_;
             int radius_outlier_min_neighbors_;
+            int min_points_to_combine_;
             uint8_t sensor_mask_;
             double horizontal_fov_;
             double vertical_fov_;

@@ -704,6 +704,18 @@ uint8_t vl53l5cx_check_data_ready(
 	return status;
 }
 
+/* Copy a results block, capped to the destination field so a corrupted
+ * frame with a bogus block size cannot overflow the results structure.
+ * Valid frames always fit, so they are copied unchanged. */
+static void _vl53l5cx_copy_block(
+		void				*p_dst,
+		size_t				dst_size,
+		const uint8_t			*p_src,
+		uint32_t			msize)
+{
+	(void)memcpy(p_dst, p_src, (msize < dst_size) ? (size_t)msize : dst_size);
+}
+
 uint8_t vl53l5cx_get_ranging_data(
 		VL53L5CX_Configuration		*p_dev,
 		VL53L5CX_ResultsData		*p_results)
@@ -741,55 +753,55 @@ uint8_t vl53l5cx_get_ranging_data(
 
 #ifndef VL53L5CX_DISABLE_AMBIENT_PER_SPAD
 			case VL53L5CX_AMBIENT_RATE_IDX:
-				(void)memcpy(p_results->ambient_per_spad,
+				_vl53l5cx_copy_block(p_results->ambient_per_spad, sizeof(p_results->ambient_per_spad),
 				&(p_dev->temp_buffer[i + (uint32_t)4]), msize);
 				break;
 #endif
 #ifndef VL53L5CX_DISABLE_NB_SPADS_ENABLED
 			case VL53L5CX_SPAD_COUNT_IDX:
-				(void)memcpy(p_results->nb_spads_enabled,
+				_vl53l5cx_copy_block(p_results->nb_spads_enabled, sizeof(p_results->nb_spads_enabled),
 				&(p_dev->temp_buffer[i + (uint32_t)4]), msize);
 				break;
 #endif
 #ifndef VL53L5CX_DISABLE_NB_TARGET_DETECTED
 			case VL53L5CX_NB_TARGET_DETECTED_IDX:
-				(void)memcpy(p_results->nb_target_detected,
+				_vl53l5cx_copy_block(p_results->nb_target_detected, sizeof(p_results->nb_target_detected),
 				&(p_dev->temp_buffer[i + (uint32_t)4]), msize);
 				break;
 #endif
 #ifndef VL53L5CX_DISABLE_SIGNAL_PER_SPAD
 			case VL53L5CX_SIGNAL_RATE_IDX:
-				(void)memcpy(p_results->signal_per_spad,
+				_vl53l5cx_copy_block(p_results->signal_per_spad, sizeof(p_results->signal_per_spad),
 				&(p_dev->temp_buffer[i + (uint32_t)4]), msize);
 				break;
 #endif
 #ifndef VL53L5CX_DISABLE_RANGE_SIGMA_MM
 			case VL53L5CX_RANGE_SIGMA_MM_IDX:
-				(void)memcpy(p_results->range_sigma_mm,
+				_vl53l5cx_copy_block(p_results->range_sigma_mm, sizeof(p_results->range_sigma_mm),
 				&(p_dev->temp_buffer[i + (uint32_t)4]), msize);
 				break;
 #endif
 #ifndef VL53L5CX_DISABLE_DISTANCE_MM
 			case VL53L5CX_DISTANCE_IDX:
-				(void)memcpy(p_results->distance_mm,
+				_vl53l5cx_copy_block(p_results->distance_mm, sizeof(p_results->distance_mm),
 				&(p_dev->temp_buffer[i + (uint32_t)4]), msize);
 				break;
 #endif
 #ifndef VL53L5CX_DISABLE_REFLECTANCE_PERCENT
 			case VL53L5CX_REFLECTANCE_EST_PC_IDX:
-				(void)memcpy(p_results->reflectance,
+				_vl53l5cx_copy_block(p_results->reflectance, sizeof(p_results->reflectance),
 				&(p_dev->temp_buffer[i + (uint32_t)4]), msize);
 				break;
 #endif
 #ifndef VL53L5CX_DISABLE_TARGET_STATUS
 			case VL53L5CX_TARGET_STATUS_IDX:
-				(void)memcpy(p_results->target_status,
+				_vl53l5cx_copy_block(p_results->target_status, sizeof(p_results->target_status),
 				&(p_dev->temp_buffer[i + (uint32_t)4]), msize);
 				break;
 #endif
 #ifndef VL53L5CX_DISABLE_MOTION_INDICATOR
 			case VL53L5CX_MOTION_DETEC_IDX:
-				(void)memcpy(&p_results->motion_indicator,
+				_vl53l5cx_copy_block(&p_results->motion_indicator, sizeof(p_results->motion_indicator),
 				&(p_dev->temp_buffer[i + (uint32_t)4]), msize);
 				break;
 #endif
