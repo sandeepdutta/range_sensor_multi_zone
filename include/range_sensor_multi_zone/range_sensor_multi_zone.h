@@ -99,6 +99,13 @@ namespace range_sensor_multi_zone
             // Per sensor published point cloud point counts
             std::vector<uint32_t> sensor_pointcloud_points_;
             std::vector<rclcpp::Time> last_sensor_read_change_times_;
+            // Time of each sensor's last successful read, for stall detection
+            std::vector<std::chrono::steady_clock::time_point> last_sensor_read_steady_;
+            double stall_restart_seconds_ = 30.0;   // 0 disables stall recovery
+            int stall_test_sensor_ = -1;            // test aid, see the parameter
+            int reinit_count_ = 0;
+            int reinit_failures_ = 0;
+            std::string last_reinit_reason_;
             rclcpp::Time last_diagnostic_check_time_;
             std::vector<rclcpp::Time> sensor_odom_timestamps_;  // Per-sensor odometry timestamps for transforms
             std::vector<rclcpp::Time> sensor_start_times_;      // Time start_ranging() completed per sensor
@@ -132,7 +139,23 @@ namespace range_sensor_multi_zone
              * Opens I2C adapter, detects sensors, loads firmware, and starts ranging.
              * Configures each sensor with resolution, frequency, and processing parameters.
              */
-            void init_sensor();
+            bool init_sensor();
+
+            /**
+             * @brief Stop ranging on every sensor and close the I2C adapter
+             *
+             * Safe to call when already closed. Errors are reported, not fatal:
+             * this also runs when a sensor or the bus has hung.
+             */
+            void close_sensors();
+
+            /**
+             * @brief Close everything and initialise it again after a stall
+             *
+             * @param reason What triggered it, for the log and diagnostics
+             * @return true when every sensor came back up
+             */
+            bool reinitialize_sensors(const std::string & reason);
 
             /**
              * @brief Main timer callback for sensor reading and processing

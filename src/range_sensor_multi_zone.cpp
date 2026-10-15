@@ -52,6 +52,12 @@ RangeSensorMultiZone::RangeSensorMultiZone()
     range_sigma_percent_threshold_ = this->declare_parameter("range_sigma_percent_threshold", 10.0); // % of distance
     target_status_filter_ = this->declare_parameter("target_status_filter", 5); // 5=valid only, 2+=accept merged targets, 0+=accept all
     ranging_frequency_hz_ = this->declare_parameter("ranging_frequency_hz", 10);
+    // An enabled sensor with no successful read for this long means the bus or
+    // the sensor has hung: everything is closed and initialised again. 0 = off.
+    stall_restart_seconds_ = this->declare_parameter("stall_restart_seconds", 30.0);
+    // Test aid for the stall recovery: reads from this sensor are ignored
+    // until the first reinitialisation, as if it had hung. -1 = off.
+    stall_test_sensor_ = this->declare_parameter("stall_test_sensor", -1);
     timer_period_ = 1000 / ranging_frequency_hz_; // in milliseconds
     // add 10% margin
     timer_period_ = (int) ((float)timer_period_ * 0.9);
@@ -121,6 +127,7 @@ RangeSensorMultiZone::RangeSensorMultiZone()
     sensor_max_sigma_percent_.resize(num_sensors_, 0.0f);
     sensor_pointcloud_points_.resize(num_sensors_, 0);
     last_sensor_read_change_times_.resize(num_sensors_, this->now());
+    last_sensor_read_steady_.assign(num_sensors_, std::chrono::steady_clock::now());
     last_diagnostic_check_time_ = this->now();
     // Initialize timing tracking
     sensor_read_times_ms_.resize(num_sensors_, 0);
@@ -157,36 +164,67 @@ RangeSensorMultiZone::RangeSensorMultiZone()
                 }
             });
     }
-    init_sensor();
+    // At startup a sensor that cannot be brought up is a wiring or power fault
+    // to fix, not something to retry around, so the node stops as before.
+    if (!init_sensor()) {
+        rclcpp::shutdown();
+        return;
+    }
     RCLCPP_INFO(this->get_logger(), "RangeSensorMultiZone constructor done");
 }
 RangeSensorMultiZone::~RangeSensorMultiZone()
 {
-    // Stop ranging for all sensors
-    if (configuration_.platform.i2c_hdl >= 0) {
-        for (int i = 0; i < num_sensors_; i++) {
-            // Skip disabled sensors
-            if (!is_sensor_enabled(i)) {
-                continue;
-            }
-            // Select the sensor
-            if (VL53L5CX_Sensor_Select(&configuration_.platform, i, VL53L5CX_DEFAULT_I2C_ADDRESS) == 0) {
-                // Stop ranging for this sensor
-                if (vl53l5cx_stop_ranging(&configuration_) == 0) {
-                    RCLCPP_INFO(this->get_logger(), "Stopped ranging for sensor %d", i);
-                } else {
-                    RCLCPP_WARN(this->get_logger(), "Failed to stop ranging for sensor %d", i);
-                }
-            } else {
-                RCLCPP_WARN(this->get_logger(), "Failed to select sensor %d for cleanup", i);
-            }
-        }
-        // Close I2C handle
-        close(configuration_.platform.i2c_hdl);
-        RCLCPP_INFO(this->get_logger(), "Closed I2C adapter %d", i2c_adapter_nr_);
-    }
+    close_sensors();
 }
-void RangeSensorMultiZone::init_sensor()
+void RangeSensorMultiZone::close_sensors()
+{
+    if (configuration_.platform.i2c_hdl < 0) {
+        return;
+    }
+    // Stop ranging on every sensor that still answers. Failures are expected
+    // when this runs because something has hung, so they are only reported.
+    for (int i = 0; i < num_sensors_; i++) {
+        if (VL53L5CX_Sensor_Select(&configuration_.platform, i, VL53L5CX_DEFAULT_I2C_ADDRESS) == 0) {
+            if (vl53l5cx_stop_ranging(&configuration_) == 0) {
+                RCLCPP_INFO(this->get_logger(), "Stopped ranging for sensor %d", i);
+            } else {
+                RCLCPP_WARN(this->get_logger(), "Failed to stop ranging for sensor %d", i);
+            }
+        } else {
+            RCLCPP_WARN(this->get_logger(), "Failed to select sensor %d for cleanup", i);
+        }
+    }
+    close(configuration_.platform.i2c_hdl);
+    configuration_.platform.i2c_hdl = -1;
+    RCLCPP_INFO(this->get_logger(), "Closed I2C adapter %d", i2c_adapter_nr_);
+}
+bool RangeSensorMultiZone::reinitialize_sensors(const std::string & reason)
+{
+    reinit_count_++;
+    last_reinit_reason_ = reason;
+    RCLCPP_ERROR(this->get_logger(), "%s: closing and reinitialising all sensors (attempt %d)",
+                 reason.c_str(), reinit_count_);
+    close_sensors();
+    // Give the bus and the sensors a moment before the reboot sequence.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const bool ok = init_sensor();
+    // Either way every sensor gets a fresh stall window: on success so a
+    // sensor is not judged on time it spent being reinitialised, on failure so
+    // the next attempt comes one stall period later instead of every cycle.
+    const auto now = std::chrono::steady_clock::now();
+    std::fill(last_sensor_read_steady_.begin(), last_sensor_read_steady_.end(), now);
+    if (ok) {
+        RCLCPP_INFO(this->get_logger(), "Reinitialisation %d succeeded", reinit_count_);
+    } else {
+        reinit_failures_++;
+        close_sensors();
+        RCLCPP_ERROR(this->get_logger(),
+                     "Reinitialisation %d failed; will try again in %.0f s", reinit_count_,
+                     stall_restart_seconds_);
+    }
+    return ok;
+}
+bool RangeSensorMultiZone::init_sensor()
 {
     /* Open the I2C on Linux */
     char i2c_hdlname[20];
@@ -194,14 +232,12 @@ void RangeSensorMultiZone::init_sensor()
     configuration_.platform.i2c_hdl = open(i2c_hdlname, O_RDWR);
     if (configuration_.platform.i2c_hdl < 0) {
         RCLCPP_ERROR(this->get_logger(), "Failed to open i2c adapter %d", i2c_adapter_nr_);
-        rclcpp::shutdown();
-        return;
+        return false;
     }
     for (int i = 0; i < num_sensors_; i++) {
         if (VL53L5CX_Sensor_Select(&configuration_.platform, i, VL53L5CX_DEFAULT_I2C_ADDRESS) != 0) {
             RCLCPP_ERROR(this->get_logger(), "Failed to select sensor %d", i);
-            rclcpp::shutdown();
-            return;
+            return false;
         }
         // Check if there is a VL53L5CX sensor connected (retry up to 3 times)
         uint8_t isAlive = 0;
@@ -214,8 +250,7 @@ void RangeSensorMultiZone::init_sensor()
                     continue;
                 }
                 RCLCPP_ERROR(this->get_logger(), "Failed check if sensor %d is alive after 3 attempts", i);
-                rclcpp::shutdown();
-                return;
+                return false;
             }
             if (!isAlive) {
                 RCLCPP_WARN(this->get_logger(), "Sensor %d is not alive (attempt %d/3)", i, retry + 1);
@@ -224,8 +259,7 @@ void RangeSensorMultiZone::init_sensor()
                     continue;
                 }
                 RCLCPP_ERROR(this->get_logger(), "Sensor %d is not alive after 3 attempts", i);
-                rclcpp::shutdown();
-                return;
+                return false;
             }
             break;
         }
@@ -233,62 +267,88 @@ void RangeSensorMultiZone::init_sensor()
         uint8_t status = vl53l5cx_init(&configuration_);
         if (status != 0) {
             RCLCPP_ERROR(this->get_logger(), "Failed to load firmware for sensor %d, error: 0x%x, perror %s", i,  status, strerror(errno));
-            rclcpp::shutdown();
-            return;
+            return false;
         }
         RCLCPP_INFO(this->get_logger(), "Sensor %d firmware loaded", i);
         if (vl53l5cx_set_resolution(&configuration_,
                                resolution_ == 4 ? VL53L5CX_RESOLUTION_4X4 : VL53L5CX_RESOLUTION_8X8) != 0) {
             RCLCPP_ERROR(this->get_logger(), "Failed to set resolution for sensor %d", i);
-            rclcpp::shutdown();
-            return;
+            return false;
         }
         RCLCPP_INFO(this->get_logger(), "Sensor %d resolution set to %dx%d", i, resolution_, resolution_);
         if (vl53l5cx_set_ranging_frequency_hz(&configuration_, ranging_frequency_hz_) != 0) {
             RCLCPP_ERROR(this->get_logger(), "Failed to set ranging frequency for sensor %d", i);
-            rclcpp::shutdown();
-            return;
+            return false;
         }
         RCLCPP_INFO(this->get_logger(), "Sensor %d ranging frequency set to %d Hz", i, ranging_frequency_hz_);
         if (vl53l5cx_set_target_order(&configuration_, VL53L5CX_TARGET_ORDER_CLOSEST) != 0) {
             RCLCPP_ERROR(this->get_logger(), "Failed to set target order for sensor %d", i);
-            rclcpp::shutdown();
-            return;
+            return false;
         }
         RCLCPP_INFO(this->get_logger(), "Sensor %d target order set to %d", i, VL53L5CX_TARGET_ORDER_CLOSEST);
         if (vl53l5cx_set_sharpener_percent(&configuration_, sharpener_percent_) != 0) {
             RCLCPP_ERROR(this->get_logger(), "Failed to set sharpener percent for sensor %d", i);
-            rclcpp::shutdown();
-            return;
+            return false;
         }
         RCLCPP_INFO(this->get_logger(), "Sensor %d sharpener percent set to %d%%", i, sharpener_percent_);
         if (vl53l5cx_set_ranging_mode(&configuration_, VL53L5CX_RANGING_MODE_CONTINUOUS) != 0) {
             RCLCPP_ERROR(this->get_logger(), "Failed to set ranging mode for sensor %d", i);
-            rclcpp::shutdown();
-            return;
+            return false;
         }
         RCLCPP_INFO(this->get_logger(), "Sensor %d Ranging mode set to Continous", i);
         if (vl53l5cx_start_ranging(&configuration_) != 0) {
             RCLCPP_ERROR(this->get_logger(), "Failed to start ranging for sensor %d", i);
-            rclcpp::shutdown();
-            return;
+            return false;
         }
         sensor_start_times_[i] = this->now();
         RCLCPP_INFO(this->get_logger(), "Sensor %d ranging started", i);
     }
+    // The stall clock starts now: loading firmware into eight sensors takes
+    // tens of seconds, and that must not count as time without data.
+    std::fill(last_sensor_read_steady_.begin(), last_sensor_read_steady_.end(),
+              std::chrono::steady_clock::now());
     RCLCPP_INFO(this->get_logger(), "RangeSensorMultiZone init_sensor done");
+    return true;
 }
 void RangeSensorMultiZone::timer_callback()
 {
     auto timer_start = std::chrono::high_resolution_clock::now();
+    // Stall recovery. A VL53L5CX can stop producing data while still answering
+    // "not ready" with no error, and it stays that way until it is rebooted;
+    // seen on the robot as one sensor silent for minutes with the node
+    // otherwise healthy. Any enabled sensor without a successful read for
+    // stall_restart_seconds closes everything and initialises it all again.
+    // This also covers a bus that was closed by a failed reinitialisation.
+    if (stall_restart_seconds_ > 0.0) {
+        const auto now = std::chrono::steady_clock::now();
+        for (int i = 0; i < num_sensors_; i++) {
+            if (!is_sensor_enabled(i)) {
+                continue;
+            }
+            const double stalled = std::chrono::duration<double>(now - last_sensor_read_steady_[i]).count();
+            if (stalled >= stall_restart_seconds_) {
+                reinitialize_sensors("Sensor " + std::to_string(i) + " (" + frame_ids_topic_names_[i] +
+                                     ") has had no data for " + std::to_string(static_cast<int>(stalled)) + " s");
+                return;  // this cycle is spent; reading resumes on the next one
+            }
+        }
+    }
+    if (configuration_.platform.i2c_hdl < 0) {
+        return;  // closed after a failed reinitialisation; waiting for the next attempt
+    }
     // Loop over the sensors
     for (int i = 0; i < num_sensors_; i++) {
         auto read_start = std::chrono::high_resolution_clock::now();
-        // Select the Sensor
+        // Select the Sensor. A failed select used to stop the node; it is now
+        // just a missed read, and if it persists the stall recovery handles it.
         if (VL53L5CX_Sensor_Select(&configuration_.platform, i, VL53L5CX_DEFAULT_I2C_ADDRESS) != 0) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to select sensor %d", i);
-            rclcpp::shutdown();
-            return;
+            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                  "Failed to select sensor %d", i);
+            sensor_read_times_ms_[i] = 0;
+            continue;
+        }
+        if (i == stall_test_sensor_ && reinit_count_ == 0) {
+            continue;  // simulated hang, see stall_test_sensor
         }
         // Check if the sensor is ready
         uint8_t isReady = 0;
@@ -324,6 +384,7 @@ void RangeSensorMultiZone::timer_callback()
         sensor_read_times_ms_[i] = std::chrono::duration_cast<std::chrono::milliseconds>(read_end - read_start).count();
         // Increment sensor read count for diagnostics
         sensor_read_counts_[i]++;
+        last_sensor_read_steady_[i] = std::chrono::steady_clock::now();
         // Store per-sensor odometry timestamp for later use in transforms
         sensor_odom_timestamps_[i] = sensor_odom_timestamp;
         // Only convert to point cloud if sensor is enabled
@@ -919,21 +980,19 @@ void RangeSensorMultiZone::diagnostic_callback(diagnostic_updater::DiagnosticSta
     std::string message;
     std::vector<std::string> stalled_sensors_warn;
     std::vector<std::string> stalled_sensors_error;
-    // Check for sensor stalls if more than 5 seconds have passed
-    if (time_elapsed >= 5.0) {
-        // Update sensor read change times if counts have changed
-        for (int i = 0; i < num_sensors_; i++) {
-            if (sensor_read_counts_[i] != last_sensor_read_counts_[i]) {
-                last_sensor_read_change_times_[i] = current_time;
-                last_sensor_read_counts_[i] = sensor_read_counts_[i];
-            }
-        }
-        // Check each sensor for stalls (only enabled sensors)
+    // Stall status from the time of each sensor's last successful read. (This
+    // used to be evaluated only when 5 s had passed since the previous
+    // diagnostics update, which with a 1 Hz update never happened, so a
+    // stalled sensor still reported "All sensors operational".)
+    (void)time_elapsed;
+    {
+        const auto steady_now = std::chrono::steady_clock::now();
         for (int i = 0; i < num_sensors_; i++) {
             if (!is_sensor_enabled(i)) {
                 continue; // Skip disabled sensors
             }
-            double sensor_stall_time = (current_time - last_sensor_read_change_times_[i]).seconds();
+            const double sensor_stall_time =
+                std::chrono::duration<double>(steady_now - last_sensor_read_steady_[i]).count();
             if (sensor_stall_time >= 30.0) {
                 sensor_error = true;
                 stalled_sensors_error.push_back("Sensor " + std::to_string(i) + " (" +
@@ -982,6 +1041,9 @@ void RangeSensorMultiZone::diagnostic_callback(diagnostic_updater::DiagnosticSta
         total_convert_time += sensor_convert_times_ms_[i];
         total_tf_time += sensor_tf_times_ms_[i];
     }
+    stat.add("Reinitialisations", reinit_count_);
+    stat.add("Reinitialisation failures", reinit_failures_);
+    stat.add("Last reinitialisation reason", last_reinit_reason_.empty() ? std::string("none") : last_reinit_reason_);
     // Add sensor read counts and data range info
     for (int i = 0; i < num_sensors_; i++) {
         std::string sensor_key = "Sensor " + std::to_string(i) + " reads";
