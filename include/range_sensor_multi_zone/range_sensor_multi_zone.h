@@ -73,6 +73,10 @@ namespace range_sensor_multi_zone
             rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr combined_pointcloud_publisher_;
             rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr laserscan_publisher_;
             std::vector<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr> pointcloud_publishers_;
+            // <topic>_floor: the floor hits the height filter drops, still in
+            // base_link. A ray that reached the floor says nothing stood in
+            // its way, which a mapper can use to clear (nimblox does).
+            std::vector<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr> floor_publishers_;
             rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
             std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
             std::shared_ptr<tf2_ros::Buffer> tf_buffer_;

@@ -94,6 +94,11 @@ RangeSensorMultiZone::RangeSensorMultiZone()
     for (int i = 0; i < num_sensors_; i++) {
         pointcloud_publishers_[i] = this->create_publisher<sensor_msgs::msg::PointCloud2>(frame_ids_topic_names_[i], 10);
     }
+    floor_publishers_.resize(num_sensors_);
+    for (int i = 0; i < num_sensors_; i++) {
+        floor_publishers_[i] = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+            frame_ids_topic_names_[i] + "_floor", 10);
+    }
     // Initialize TF2
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -484,6 +489,9 @@ void RangeSensorMultiZone::convert_to_pointcloud(int sensor_id, const VL53L5CX_R
     auto convert_start = std::chrono::high_resolution_clock::now();
     // Create PCL point cloud for processing
     pcl::PointCloud<pcl::PointXYZI>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZI>);
+    // Floor hits, kept only while someone listens on <topic>_floor.
+    pcl::PointCloud<pcl::PointXYZI>::Ptr floor_cloud(new pcl::PointCloud<pcl::PointXYZI>);
+    const bool want_floor = floor_publishers_[sensor_id]->get_subscription_count() > 0;
     // VL53L5CX field of view and zone layout
     // Use configurable field of view parameters
     const float horizontal_fov_rad = horizontal_fov_ * M_PI / 180.0f; // Convert degrees to radians
@@ -573,6 +581,14 @@ void RangeSensorMultiZone::convert_to_pointcloud(int sensor_id, const VL53L5CX_R
             float spad_min_z = calibration_min_z_[sensor_id][zone_id] + min_height_;
             if (std::isnan(spad_min_z)) spad_min_z = min_height_;
             if (z < spad_min_z || z > max_height_) {
+                if (want_floor && z < spad_min_z) {
+                    pcl::PointXYZI floor_point;
+                    floor_point.x = x;
+                    floor_point.y = y;
+                    floor_point.z = z;
+                    floor_point.intensity = static_cast<float>(range_sigma_mm);
+                    floor_cloud->points.push_back(floor_point);
+                }
                 continue; // Skip this point
             }
             // Track range sigma min/max
@@ -618,6 +634,15 @@ void RangeSensorMultiZone::convert_to_pointcloud(int sensor_id, const VL53L5CX_R
     // Publish individual point cloud in base_link frame
     if (pointcloud_publishers_[sensor_id]->get_subscription_count() > 0) {
         pointcloud_publishers_[sensor_id]->publish(sensor_pointclouds_[sensor_id]);
+    }
+    if (want_floor) {
+        floor_cloud->width = floor_cloud->points.size();
+        floor_cloud->height = 1;
+        floor_cloud->is_dense = true;
+        sensor_msgs::msg::PointCloud2 floor_msg;
+        pcl::toROSMsg(*floor_cloud, floor_msg);
+        floor_msg.header = sensor_pointclouds_[sensor_id].header;
+        floor_publishers_[sensor_id]->publish(floor_msg);
     }
 }
 void RangeSensorMultiZone::publish_data()
