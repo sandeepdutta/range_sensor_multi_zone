@@ -18,6 +18,7 @@
 #include <tf2/LinearMath/Transform.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include "range_sensor_multi_zone/range_sensor_multi_zone.h"
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include "range_sensor_multi_zone/vl53l5cx_api.h"
 
 namespace range_sensor_multi_zone
@@ -172,6 +173,21 @@ RangeSensorMultiZone::RangeSensorMultiZone()
     // At startup a sensor that cannot be brought up is a wiring or power fault
     // to fix, not something to retry around, so the node stops as before.
     if (!init_sensor()) {
+        // Say so on /diagnostics before stopping: the 1 Hz diagnostics timer never ran (the node
+        // has not spun yet), so the status LED never heard of this ring and stayed green.
+        auto pub = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/diagnostics", 10);
+        diagnostic_msgs::msg::DiagnosticArray arr;
+        diagnostic_msgs::msg::DiagnosticStatus st;
+        st.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+        st.name = std::string(this->get_name()) + ": Sensor Status";
+        st.hardware_id = this->get_parameter("hardware_id").as_string();
+        st.message = "ERROR: a sensor did not come up at startup (see the log); node stopped";
+        arr.status.push_back(st);
+        for (int k = 0; k < 6; ++k) {  // a few times, so a subscriber that is still matching gets it
+            arr.header.stamp = this->now();
+            pub->publish(arr);
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
         rclcpp::shutdown();
         return;
     }
@@ -189,6 +205,9 @@ void RangeSensorMultiZone::close_sensors()
     // Stop ranging on every sensor that still answers. Failures are expected
     // when this runs because something has hung, so they are only reported.
     for (int i = 0; i < num_sensors_; i++) {
+        if (!is_sensor_enabled(i)) {
+            continue;
+        }
         if (VL53L5CX_Sensor_Select(&configuration_.platform, i, VL53L5CX_DEFAULT_I2C_ADDRESS) == 0) {
             if (vl53l5cx_stop_ranging(&configuration_) == 0) {
                 RCLCPP_INFO(this->get_logger(), "Stopped ranging for sensor %d", i);
@@ -240,6 +259,13 @@ bool RangeSensorMultiZone::init_sensor()
         return false;
     }
     for (int i = 0; i < num_sensors_; i++) {
+        // A sensor masked off in sensor_mask is not brought up at all, so a dead one can be
+        // left out without stopping the rest of the ring.
+        if (!is_sensor_enabled(i)) {
+            RCLCPP_WARN(this->get_logger(), "Sensor %d (%s) disabled by sensor_mask, not initialised", i,
+                        frame_ids_topic_names_[i].c_str());
+            continue;
+        }
         if (VL53L5CX_Sensor_Select(&configuration_.platform, i, VL53L5CX_DEFAULT_I2C_ADDRESS) != 0) {
             RCLCPP_ERROR(this->get_logger(), "Failed to select sensor %d", i);
             return false;
@@ -343,6 +369,9 @@ void RangeSensorMultiZone::timer_callback()
     }
     // Loop over the sensors
     for (int i = 0; i < num_sensors_; i++) {
+        if (!is_sensor_enabled(i)) {
+            continue;  // masked off in sensor_mask: never selected or read
+        }
         auto read_start = std::chrono::high_resolution_clock::now();
         // Select the Sensor. A failed select used to stop the node; it is now
         // just a missed read, and if it persists the stall recovery handles it.
@@ -424,8 +453,15 @@ void RangeSensorMultiZone::timer_callback()
     if (combined_pointcloud_publisher_->get_subscription_count() > 0) {
         pcl::PointCloud<pcl::PointXYZI>::Ptr combined_pcl_cloud(new pcl::PointCloud<pcl::PointXYZI>);
         rclcpp::Time last_added_timestamp;
+        // Newest stamp of any enabled sensor's cloud, empty or not: an empty combined cloud is
+        // stamped with it.
+        rclcpp::Time newest_timestamp(0, 0, this->get_clock()->get_clock_type());
         // Combine all enabled sensor point clouds - already transformed to base_link
         for (int i = 0; i < num_sensors_; i++) {
+            if (is_sensor_enabled(i) && !sensor_pointclouds_[i].header.frame_id.empty()) {
+                rclcpp::Time stamp(sensor_pointclouds_[i].header.stamp, this->get_clock()->get_clock_type());
+                if (stamp > newest_timestamp) newest_timestamp = stamp;
+            }
             if (!is_sensor_enabled(i) ||
                 sensor_pointclouds_[i].data.empty() ||
                 static_cast<int>(sensor_pointclouds_[i].width * sensor_pointclouds_[i].height) <
@@ -437,14 +473,24 @@ void RangeSensorMultiZone::timer_callback()
             // Track the timestamp of the last sensor point cloud added
             last_added_timestamp = sensor_pointclouds_[i].header.stamp;
         }
-        // Convert combined PCL cloud to ROS message and publish
+        // Convert combined PCL cloud to ROS message and publish. Published even when empty
+        // (every zone out of range, e.g. in open space): costmap layers treat a silent topic as
+        // a dead sensor once expected_update_rate passes and Nav2 stops, while an empty cloud
+        // says "nothing seen".
+        combined_pcl_cloud->width = combined_pcl_cloud->points.size();
+        combined_pcl_cloud->height = 1;
+        combined_pcl_cloud->is_dense = true;
+        sensor_msgs::msg::PointCloud2 combined_cloud_msg;
+        pcl::toROSMsg(*combined_pcl_cloud, combined_cloud_msg);
         if (combined_pcl_cloud->points.size() > 0) {
-            sensor_msgs::msg::PointCloud2 combined_cloud_msg;
-            pcl::toROSMsg(*combined_pcl_cloud, combined_cloud_msg);
             combined_cloud_msg.header.stamp = last_added_timestamp;
-            combined_cloud_msg.header.frame_id = "base_link";
-            combined_pointcloud_publisher_->publish(combined_cloud_msg);
+        } else if (newest_timestamp.nanoseconds() > 0) {
+            combined_cloud_msg.header.stamp = newest_timestamp;
+        } else {
+            combined_cloud_msg.header.stamp = this->get_clock()->now();
         }
+        combined_cloud_msg.header.frame_id = "base_link";
+        combined_pointcloud_publisher_->publish(combined_cloud_msg);
     }
     // Update diagnostics if verbose mode is enabled
     if (diag_verbose_ && diagnostic_updater_) {
