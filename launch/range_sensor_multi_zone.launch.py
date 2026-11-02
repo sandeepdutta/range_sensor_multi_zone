@@ -34,12 +34,12 @@ def generate_launch_description():
                                      'vertical_fov': 45.0, # degrees
                                      'sharpener_percent': 25, #
                                      'diag_verbose': False,
-                                     'frame_ids': ['TOP_LF_TOF', #0 bottom left front
-                                                   'TOP_FS_TOF', #1 bottom fron straight
-                                                   'TOP_RF_TOF', #2 bottom right front
-                                                   'TOP_RS_TOF', #3 bottom right straight
-                                                   'TOP_RB_TOF', #4 bottom right back
-                                                   'TOP_BS_TOF', #5 bottom back straight
-                                                   'TOP_LB_TOF', #6 bottom left back
-                                                   'TOP_LS_TOF']}] #7 bottom left straight
+                                     'frame_ids': ['TOPV_LF_link', #0 bottom left front
+                                                   'TOPV_FS_link', #1 bottom fron straight
+                                                   'TOPV_RF_link', #2 bottom right front
+                                                   'TOPV_RS_link', #3 bottom right straight
+                                                   'TOPV_RB_link', #4 bottom right back
+                                                   'TOPV_BS_link', #5 bottom back straight
+                                                   'TOPV_LB_link', #6 bottom left back
+                                                   'TOPV_LS_link']}] #7 bottom left straight
                                 )])
