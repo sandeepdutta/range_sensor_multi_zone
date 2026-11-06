@@ -43,8 +43,11 @@ namespace range_sensor_multi_zone
         public:
             explicit RangeSensorMultiZone();
             ~RangeSensorMultiZone();
+            // False if a sensor did not come up at startup; main() then exits instead of spinning
+            bool initialized() const { return initialized_; }
 
         private:
+            bool initialized_ = false;
             int i2c_adapter_nr_;
             int num_sensors_;
             int timer_period_;

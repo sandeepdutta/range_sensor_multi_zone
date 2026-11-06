@@ -188,9 +188,11 @@ RangeSensorMultiZone::RangeSensorMultiZone()
             pub->publish(arr);
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
-        rclcpp::shutdown();
+        // main() sees initialized() false and exits; shutting rclcpp down here instead made
+        // rclcpp::spin() throw on the dead context and abort the process
         return;
     }
+    initialized_ = true;
     RCLCPP_INFO(this->get_logger(), "RangeSensorMultiZone constructor done");
 }
 RangeSensorMultiZone::~RangeSensorMultiZone()
@@ -1178,7 +1180,15 @@ void RangeSensorMultiZone::diagnostic_callback(diagnostic_updater::DiagnosticSta
 int main(int argc, char ** argv)
 {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<range_sensor_multi_zone::RangeSensorMultiZone>());
+    auto node = std::make_shared<range_sensor_multi_zone::RangeSensorMultiZone>();
+    if (!node->initialized()) {
+        // A sensor did not come up: stop the ones that did and close the bus, then exit
+        node.reset();
+        rclcpp::shutdown();
+        return 1;
+    }
+    rclcpp::spin(node);
+    node.reset();
     rclcpp::shutdown();
     return 0;
 }
