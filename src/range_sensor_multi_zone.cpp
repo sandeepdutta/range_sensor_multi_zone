@@ -147,6 +147,26 @@ RangeSensorMultiZone::RangeSensorMultiZone()
     calibration_sensor_transforms_.assign(num_sensors_, tf2::Transform::getIdentity());
     calibration_sensor_transform_valid_.assign(num_sensors_, false);
     tilt_corrections_rad_.assign(num_sensors_, 0.0);
+    // Horizontal (yaw) correction per sensor, degrees, in frame_ids order, positive = the sensor
+    // actually looks further left (counter-clockwise from above) than the URDF says. The floor
+    // calibration only finds pitch, and a horizontal ring (TOPH) never sees the floor, so this is
+    // fitted offline: nav2_debug/bag_check/toph_calib.py against a camera-only map. Empty = none.
+    {
+        const auto yaw_deg = this->declare_parameter<std::vector<double>>("yaw_corrections_deg", std::vector<double>{});
+        yaw_corrections_rad_.assign(num_sensors_, 0.0);
+        if (!yaw_deg.empty() && static_cast<int>(yaw_deg.size()) != num_sensors_) {
+            RCLCPP_ERROR(this->get_logger(), "yaw_corrections_deg has %zu entries, needs %d (one per frame_ids entry): ignored",
+                         yaw_deg.size(), num_sensors_);
+        } else {
+            for (size_t i = 0; i < yaw_deg.size(); i++) {
+                yaw_corrections_rad_[i] = yaw_deg[i] * M_PI / 180.0;
+                if (yaw_deg[i] != 0.0) {
+                    RCLCPP_INFO(this->get_logger(), "Sensor %zu (%s): yaw correction %+.1f deg", i,
+                                frame_ids_topic_names_[i].c_str(), yaw_deg[i]);
+                }
+            }
+        }
+    }
     calibration_reading_counts_.assign(num_sensors_, std::vector<uint32_t>(VL53L5CX_RESOLUTION_8X8, 0));
     calibration_min_z_.assign(num_sensors_, std::vector<float>(VL53L5CX_RESOLUTION_8X8, std::numeric_limits<float>::quiet_NaN()));
     load_calibration();
@@ -193,7 +213,83 @@ RangeSensorMultiZone::RangeSensorMultiZone()
         return;
     }
     initialized_ = true;
+    // Registered last: a set during startup would otherwise touch sensors not yet initialised
+    parameter_callback_ = this->add_on_set_parameters_callback(
+        std::bind(&RangeSensorMultiZone::on_set_parameters, this, std::placeholders::_1));
     RCLCPP_INFO(this->get_logger(), "RangeSensorMultiZone constructor done");
+}
+rcl_interfaces::msg::SetParametersResult RangeSensorMultiZone::on_set_parameters(
+    const std::vector<rclcpp::Parameter> & parameters)
+{
+    rcl_interfaces::msg::SetParametersResult result;
+    result.successful = true;
+    // Validate everything first, so a rejected set changes nothing
+    for (const auto & p : parameters) {
+        const std::string & n = p.get_name();
+        if (n == "range_sigma_percent_threshold" || n == "min_height" || n == "max_height" ||
+            n == "radius_outlier_radius") {
+            if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE) {
+                result.successful = false; result.reason = n + " must be a double (e.g. 2.0)"; return result;
+            }
+            if (n == "radius_outlier_radius" && p.as_double() <= 0.0) {
+                result.successful = false; result.reason = n + " must be > 0"; return result;
+            }
+        } else if (n == "target_status_filter" || n == "min_distance" || n == "max_distance" ||
+                   n == "radius_outlier_min_neighbors" || n == "min_points_to_combine" ||
+                   n == "sharpener_percent") {
+            if (p.get_type() != rclcpp::ParameterType::PARAMETER_INTEGER) {
+                result.successful = false; result.reason = n + " must be an integer"; return result;
+            }
+            const int64_t v = p.as_int();
+            if ((n == "target_status_filter" && (v < 0 || v > 255)) || (n == "sharpener_percent" && (v < 0 || v > 99)) ||
+                v < 0) {
+                result.successful = false; result.reason = n + " out of range"; return result;
+            }
+        } else if (n == "radius_outlier_enabled") {
+            if (p.get_type() != rclcpp::ParameterType::PARAMETER_BOOL) {
+                result.successful = false; result.reason = n + " must be a bool"; return result;
+            }
+        } else if (n == "hardware_id" || n.rfind("qos_overrides", 0) == 0 || n == "use_sim_time") {
+            // declared by rclcpp / diagnostics: leave them to their own handling
+        } else {
+            result.successful = false;
+            result.reason = n + " cannot change at runtime (restart the node)";
+            return result;
+        }
+    }
+    for (const auto & p : parameters) {
+        const std::string & n = p.get_name();
+        if (n == "range_sigma_percent_threshold") range_sigma_percent_threshold_ = static_cast<float>(p.as_double());
+        else if (n == "min_height") min_height_ = p.as_double();
+        else if (n == "max_height") max_height_ = p.as_double();
+        else if (n == "radius_outlier_radius") radius_outlier_radius_ = p.as_double();
+        else if (n == "radius_outlier_enabled") radius_outlier_enabled_ = p.as_bool();
+        else if (n == "target_status_filter") target_status_filter_ = static_cast<uint8_t>(p.as_int());
+        else if (n == "min_distance") min_distance_ = static_cast<int>(p.as_int());
+        else if (n == "max_distance") max_distance_ = static_cast<int>(p.as_int());
+        else if (n == "radius_outlier_min_neighbors") radius_outlier_min_neighbors_ = static_cast<int>(p.as_int());
+        else if (n == "min_points_to_combine") min_points_to_combine_ = static_cast<int>(p.as_int());
+        else if (n == "sharpener_percent") {
+            sharpener_percent_ = static_cast<int>(p.as_int());
+            // A sensor setting: stop, set, start each enabled sensor
+            for (int i = 0; i < num_sensors_; i++) {
+                if (!is_sensor_enabled(i)) continue;
+                if (VL53L5CX_Sensor_Select(&configuration_.platform, i, VL53L5CX_DEFAULT_I2C_ADDRESS) != 0 ||
+                    vl53l5cx_stop_ranging(&configuration_) != 0 ||
+                    vl53l5cx_set_sharpener_percent(&configuration_, sharpener_percent_) != 0 ||
+                    vl53l5cx_start_ranging(&configuration_) != 0) {
+                    RCLCPP_ERROR(this->get_logger(), "sharpener_percent %d: sensor %d failed (stall restart will reinitialise it)",
+                                 sharpener_percent_, i);
+                    continue;
+                }
+                sensor_start_times_[i] = this->now();
+            }
+        } else {
+            continue;
+        }
+        RCLCPP_INFO(this->get_logger(), "Runtime parameter %s = %s", n.c_str(), p.value_to_string().c_str());
+    }
+    return result;
 }
 RangeSensorMultiZone::~RangeSensorMultiZone()
 {
@@ -531,7 +627,8 @@ void RangeSensorMultiZone::convert_to_pointcloud(int sensor_id, const VL53L5CX_R
         calibration_sensor_transform_valid_[sensor_id] = true;
     }
     sensor_to_base_link = sensor_to_base_link *
-        tf2::Transform(tf2::Quaternion(tf2::Vector3(0, 1, 0), tilt_corrections_rad_[sensor_id]));
+        tf2::Transform(tf2::Quaternion(tf2::Vector3(0, 1, 0), tilt_corrections_rad_[sensor_id])) *
+        tf2::Transform(tf2::Quaternion(tf2::Vector3(0, 0, 1), yaw_corrections_rad_[sensor_id]));
     auto tf_end = std::chrono::high_resolution_clock::now();
     sensor_tf_times_ms_[sensor_id] = std::chrono::duration_cast<std::chrono::milliseconds>(tf_end - tf_start).count();
     auto convert_start = std::chrono::high_resolution_clock::now();

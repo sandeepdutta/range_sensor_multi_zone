@@ -137,6 +137,7 @@ namespace range_sensor_multi_zone
             std::vector<tf2::Transform> calibration_sensor_transforms_;  // [sensor] URDF sensor to base_link seen while calibrating
             std::vector<bool> calibration_sensor_transform_valid_;
             std::vector<double> tilt_corrections_rad_;      // [sensor] tilt about the sensor y axis, positive = further down than the URDF
+            std::vector<double> yaw_corrections_rad_;       // [sensor] yaw about the sensor z axis (yaw_corrections_deg), positive = to the left
             std::vector<std::vector<float>> calibration_min_z_;  // [sensor][spad] min z, NaN = not calibrated (use min_height)
             rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr calibration_sub_;
 
@@ -163,6 +164,20 @@ namespace range_sensor_multi_zone
              * @return true when every sensor came back up
              */
             bool reinitialize_sensors(const std::string & reason);
+
+            /**
+             * @brief Apply filter parameters changed at runtime (ros2 param set)
+             *
+             * Point filters take effect on the next frame: range_sigma_percent_threshold,
+             * target_status_filter, min/max_distance, min/max_height, radius_outlier_*,
+             * min_points_to_combine. sharpener_percent is a sensor setting: every enabled sensor
+             * is stopped, set and restarted (a frame or two lost). Other parameters still need
+             * a restart and are rejected. The node is single threaded (rclcpp::spin), so this
+             * never runs during timer_callback.
+             */
+            rcl_interfaces::msg::SetParametersResult on_set_parameters(
+                const std::vector<rclcpp::Parameter> & parameters);
+            rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr parameter_callback_;
 
             /**
              * @brief Main timer callback for sensor reading and processing
